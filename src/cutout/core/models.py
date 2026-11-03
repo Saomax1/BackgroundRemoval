@@ -42,7 +42,9 @@ class ModelSpec:
     # Direct download for ready-made ONNX files; None means "built by scripts/export_birefnet_onnx.py".
     url: str | None = None
     sha256: str | None = None
-    # Where the PyTorch weights come from when we export the ONNX ourselves.
+    # Where the PyTorch weights come from when we export the ONNX ourselves:
+    # "hf:<owner>/<repo>" (a transformers BiRefNet repo) or
+    # "hf:<owner>/<repo>/<file>.pth" (a fine-tuned state dict for the base BiRefNet).
     export_source: str | None = None
     description: str = ""
 
@@ -91,7 +93,7 @@ REGISTRY: dict[str, ModelSpec] = {
             mean=IMAGENET_MEAN,
             std=IMAGENET_STD,
             output_index=-1,
-            export_source="hf:joelseytre/toonout",
+            export_source="hf:joelseytre/toonout/birefnet_finetuned_toonout.pth",
             description="BiRefNet fine-tuned on anime characters (ToonOut). Best anime hair/edges.",
         ),
         ModelSpec(

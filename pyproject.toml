@@ -23,6 +23,8 @@ cpu = ["onnxruntime>=1.21"]
 # Desktop editor window (src/cutout/ui).
 ui = ["PySide6>=6.7"]
 dev = ["pytest>=8", "onnx>=1.16"]
+# Windows installer build: packaging/cutout.spec + packaging/cutout.iss (see packaging/README.md).
+build = ["pyinstaller>=6.10"]
 
 [project.scripts]
 cutout = "cutout.cli:main"
