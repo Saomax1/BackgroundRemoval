@@ -49,7 +49,7 @@ from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, load_image, save_p
 from ..core.models import REGISTRY, ModelNotInstalled, Subject
 from ..core.runtime import GpuOutOfMemory
 from ..core.refine import compose_rgba
-from . import debug_menu
+from . import debug_menu, update_ui
 from .canvas import Backdrop, CutoutCanvas
 from .document import CutoutDocument
 from .tools import CanvasTool, PanTool, ToolContext
@@ -214,6 +214,7 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._build_statusbar()
         debug_menu.install(self)
+        update_ui.install(self)
 
         self.doc.image_changed.connect(self._on_image_changed)
         self.doc.result_changed.connect(self._on_result_changed)

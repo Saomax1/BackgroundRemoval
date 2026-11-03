@@ -7,10 +7,13 @@ out is exactly the same size as what went in.
 
 **Where things stand:** the background-removal engine works from a command
 window today. The point-and-click app and the touch-up brush are being built
-next. A one-click `Setup.exe` that installs everything (models included) is
-built automatically on GitHub; see [packaging/README.md](packaging/README.md)
-for where to download it. Until you have that, use the steps below. You only
-do them once.
+next. A one-click `Setup.exe` is built automatically on GitHub: download it
+from the [latest release](https://github.com/Saomax1/BackgroundRemoval/releases/latest)
+(no sign-in needed). The first time Cutout starts it downloads its AI models
+(about 3 GB, once). To update later, choose **Help > Check for Updates** in the
+app: it downloads only what changed, usually a few tens of MB, and restarts.
+Your settings are kept. Details are in [packaging/README.md](packaging/README.md).
+If you'd rather run from source, use the steps below. You only do them once.
 
 ---
 

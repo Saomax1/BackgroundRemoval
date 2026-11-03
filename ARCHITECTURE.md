@@ -12,7 +12,8 @@ input resolution. This document is the map for everyone building on the engine.
 | Inference | ONNX Runtime GPU, CUDA execution provider | Runs exported models without shipping PyTorch (~2.5 GB saved). CUDA 12 + cuDNN come as pip wheels (`onnxruntime-gpu[cuda,cudnn]`) and are loaded by `onnxruntime.preload_dlls()`, so the user installs nothing but the app. Falls back to CPU if CUDA fails. |
 | Image ops | NumPy + OpenCV (headless) + Pillow | OpenCV for fast filters and 16-bit PNG/TIFF, Pillow for EXIF, ICC and palette formats. Headless OpenCV avoids clashing with Qt. |
 | UI | PySide6 (Qt 6) | Native-feeling Windows UI, a fast `QGraphicsView` canvas for brushing at full resolution, Qt threads for keeping the UI responsive. |
-| Installer | PyInstaller one-folder build + Inno Setup 6.5.2+ | One `Setup.exe` (Inno's single-file limit is about 4 GB), desktop and Start-menu shortcuts, uninstaller. Models are copied into `{app}\models`. Built and smoke-tested in GitHub Actions; see `packaging/README.md`. |
+| Installer | PyInstaller one-folder build + Inno Setup 6.5.2+ | A small `Setup.exe` on GitHub Releases, desktop and Start-menu shortcuts, uninstaller. The GPU runtime and models are separate *packs* the app downloads on first start. Built, smoke-tested and published by GitHub Actions; see `packaging/README.md`. |
+| Updates | `cutout.update` + a PowerShell helper | Help > Check for Updates downloads only the packs whose content hash changed (usually just the app, tens of MB), checks every byte, then swaps files after the app exits with automatic rollback. Offline unless the user asks. |
 
 ## Models
 
@@ -95,7 +96,10 @@ src/cutout/
     select.py      ClickSelector: clicks -> full-res, edge-refined Selection
     rect.py        Rect: the dirty area every edit returns, for partial repaints
   ui/              PySide6 editor window (see "Editor window" below)
-packaging/         PyInstaller spec, Inno Setup script, model staging (packaging/README.md)
+    update_ui.py   Help > Check for Updates, the update and finish-setup dialog
+  update/          updater, no Qt: packs.py (how the install splits), manifest.py
+                   (cutout-release.json), client.py (check, download, apply), apply_update.ps1
+packaging/         PyInstaller spec, Inno Setup script, model staging, release packs (packaging/README.md)
 scripts/           build-time model download, export and checks
 ```
 
@@ -191,7 +195,9 @@ engine.release_models()  # unload everything, e.g. before a memory-hungry step
   calls `cutout.ui.main(argv)`) and `cutout-cli.exe` (console). Every DLL from
   the `nvidia-*` wheels is copied flat into `_internal\nvidia_dlls`, which
   `runtime.py` adds to the DLL search path before ORT loads CUDA. Models go in
-  `{app}\models`. The smoke test after install is `cutout-cli.exe --diagnose`,
+  `{app}\models`. Setup carries only the app, libraries and Qt; the app
+  downloads the rest on first start (`cutout.update`), so the window must open
+  even with no models or CUDA DLLs installed. The smoke test after install is `cutout-cli.exe --diagnose`,
   `--list-models` and one run per subject on a generated sample. New models only
   need a registry entry: `scripts/build_models.py` builds and checks every entry.
 
