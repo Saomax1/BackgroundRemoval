@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+# Model weights are large binaries fetched/exported at build time, never committed.
+models/*
+!models/README.md

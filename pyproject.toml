@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cutout"
+version = "0.1.0"
+description = "Offline, GPU-accelerated background removal for people and anime characters"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "pillow>=10.3",
+]
+
+[project.optional-dependencies]
+# NVIDIA build (what the Windows installer ships). The [cuda,cudnn] extras pull the
+# CUDA 12 runtime + cuDNN as pip wheels so the user never installs the CUDA toolkit.
+gpu = ["onnxruntime-gpu[cuda,cudnn]>=1.21"]
+# CPU-only fallback, used by CI and for development machines without NVIDIA.
+cpu = ["onnxruntime>=1.21"]
+dev = ["pytest>=8", "onnx>=1.16"]
+
+[project.scripts]
+cutout = "cutout.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
