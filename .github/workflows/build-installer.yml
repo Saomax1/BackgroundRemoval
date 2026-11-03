@@ -49,6 +49,12 @@ jobs:
       - name: Free disk space
         if: steps.cache.outputs.cache-hit != 'true'
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: Add swap for the 2048 px export
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-export && sudo chmod 600 /swapfile-export
+          sudo mkswap /swapfile-export && sudo swapon /swapfile-export && free -h
       - uses: actions/setup-python@v5
         if: steps.cache.outputs.cache-hit != 'true'
         with:

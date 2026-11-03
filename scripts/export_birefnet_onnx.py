@@ -59,7 +59,7 @@ def main() -> int:
             print(f"warning: {len(missing)} missing / {len(unexpected)} unexpected keys")
     else:
         net = AutoModelForImageSegmentation.from_pretrained(repo, trust_remote_code=True)
-    net.eval()
+    net.eval().requires_grad_(False)
 
     class Final(torch.nn.Module):
         def __init__(self, inner):
@@ -76,16 +76,19 @@ def main() -> int:
     dummy = torch.randn(1, 3, s, s)
     dest = model_path(spec, args.models_dir)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        Final(net),
-        dummy,
-        str(dest),
-        input_names=["input_image"],
-        output_names=["alpha"],
-        opset_version=args.opset,
-        do_constant_folding=True,
-        dynamo=False,
-    )
+    # no_grad: without it the trace keeps every activation for autograd, and the
+    # 2048 px HR model runs a 16 GB CI runner out of memory.
+    with torch.no_grad():
+        torch.onnx.export(
+            Final(net),
+            dummy,
+            str(dest),
+            input_names=["input_image"],
+            output_names=["alpha"],
+            opset_version=args.opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
     print(f"wrote {dest}")
     return 0
 
