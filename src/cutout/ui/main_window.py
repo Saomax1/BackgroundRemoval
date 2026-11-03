@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 from ..core.engine import CutoutEngine, CutoutResult
 from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, load_image, save_png
 from ..core.models import REGISTRY, ModelNotInstalled, Subject
+from ..core.runtime import GpuOutOfMemory
 from ..core.refine import compose_rgba
 from .canvas import Backdrop, CutoutCanvas
 from .document import CutoutDocument
@@ -587,6 +588,8 @@ class MainWindow(QMainWindow):
         if gen != self._generation or image is not self.doc.image:
             return  # superseded by another open / run
         self.doc.set_auto_result(result)
+        if result.notice:
+            self.statusBar().showMessage(result.notice, 15000)
         self.cutout_ready.emit()
 
     def _on_remove_failed(self, gen: int, subject: Subject, exc: BaseException) -> None:
@@ -601,6 +604,8 @@ class MainWindow(QMainWindow):
                 f"Models folder:\n{self.engine.models_dir}\n\n"
                 "Reinstall Cutout, or copy the model files into that folder.",
             )
+        elif isinstance(exc, GpuOutOfMemory):
+            self._report_error("Out of memory", exc)
         else:
             self._report_error("Background removal failed", exc)
 
