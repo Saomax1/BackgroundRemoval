@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from .models import ModelSpec, ResizeMode
-from .runtime import SessionInfo, create_session
+from .runtime import SessionInfo, create_session, run_options
 
 
 class Segmenter(Protocol):
@@ -36,6 +36,7 @@ class OnnxSegmenter:
         inp = self.session.get_inputs()[0]
         self._input_name = inp.name
         self._input_dtype = np.float16 if "float16" in inp.type else np.float32
+        self._run_opts = run_options(self.info)
 
     @property
     def name(self) -> str:
@@ -47,7 +48,9 @@ class OnnxSegmenter:
 
     def predict(self, rgb: np.ndarray) -> np.ndarray:
         tensor, crop = preprocess(rgb, self.spec)
-        outputs = self.session.run(None, {self._input_name: tensor.astype(self._input_dtype)})
+        outputs = self.session.run(
+            None, {self._input_name: tensor.astype(self._input_dtype)}, self._run_opts
+        )
         return postprocess(outputs[self.spec.output_index], crop, self.spec)
 
     def warmup(self) -> None:

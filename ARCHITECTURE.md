@@ -112,7 +112,29 @@ result.save_png(out)
 # after edits:
 rgba = compose_rgba(result.image, edited_alpha)
 save_png(out, rgba, result.image.icc_profile)
+result.notice       # None, or a message to show (e.g. "ran on the CPU because the GPU was full")
+engine.release_models()  # unload everything, e.g. before a memory-hungry step
 ```
+
+### GPU and RAM use
+
+- One automatic-removal model is loaded at a time. Switching subject (or model)
+  drops the old session before the new one is created; the 2048 px person model
+  and ToonOut together don't fit on a typical 8-12 GB card.
+- Sessions use `arena_extend_strategy=kSameAsRequested` and every run asks ORT
+  to shrink the GPU arena afterwards (`memory.enable_memory_arena_shrinkage`),
+  so activations are not parked in VRAM between runs. The CPU arena is off for
+  the same reason in RAM.
+- cuDNN uses `HEURISTIC` algorithm search with a capped workspace. `EXHAUSTIVE`
+  tries algorithms that want GB-sized scratch buffers and was enough on its own
+  to run out of VRAM.
+- On an out-of-memory error the engine unloads every model (including
+  click-to-select), retries on the GPU, and with `device="auto"` then runs that
+  one image on the CPU and sets `result.notice`. The CPU session isn't cached,
+  so the next image tries the GPU again. Otherwise it raises `GpuOutOfMemory`
+  with a readable message. Never recover inside the `except` block: the live
+  traceback keeps the failed session (and its VRAM) alive.
+- Output resolution is unaffected by all of this: models run at their fixed size.
 
 ### Contracts for the follow-on work
 

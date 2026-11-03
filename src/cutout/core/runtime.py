@@ -30,6 +30,30 @@ class DeviceUnavailable(RuntimeError):
     pass
 
 
+class GpuOutOfMemory(RuntimeError):
+    """The graphics card (or, after the CPU fallback, the PC) ran out of memory for a model."""
+
+
+# Fragments ORT / CUDA / cuDNN put in the message when an allocation fails.
+_OOM_MARKERS = (
+    "failed to allocate memory",
+    "bfcarena",
+    "out of memory",
+    "cudaerrormemoryallocation",
+    "cudnn_status_alloc_failed",
+    "cublas_status_alloc_failed",
+    "std::bad_alloc",
+)
+
+
+def is_out_of_memory(exc: BaseException) -> bool:
+    """True if ``exc`` is an allocation failure from ONNX Runtime or the CUDA libraries."""
+    if isinstance(exc, (MemoryError, GpuOutOfMemory)):
+        return True
+    text = str(exc).lower()
+    return any(m in text for m in _OOM_MARKERS)
+
+
 @dataclass(frozen=True)
 class SessionInfo:
     model_path: Path
@@ -38,6 +62,20 @@ class SessionInfo:
     @property
     def on_gpu(self) -> bool:
         return self.provider != "CPUExecutionProvider"
+
+
+def run_options(info: SessionInfo):
+    """``RunOptions`` that hand the memory a run used back to the system once it finishes.
+
+    Without this ONNX Runtime keeps every activation buffer of the biggest run in its
+    arena for the life of the session, so a 2048 px BiRefNet run parks several GB of
+    VRAM that the next model then cannot get.
+    """
+    ort = _ort()
+    ro = ort.RunOptions()
+    if info.on_gpu:
+        ro.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+    return ro
 
 
 def _ort():
@@ -163,6 +201,9 @@ def create_session(model_path: Path, device: str = "auto"):
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     opts.log_severity_level = 3
+    # The CPU arena never gives memory back, and the person model's input and any
+    # CPU-placed nodes are large; plain malloc/free keeps RAM use to what is in use now.
+    opts.enable_cpu_mem_arena = False
 
     providers: list = ["CPUExecutionProvider"]
     want_cuda = device in ("auto", "cuda")
@@ -170,8 +211,12 @@ def create_session(model_path: Path, device: str = "auto"):
         _preload_cuda_dlls()
         if "CUDAExecutionProvider" in ort.get_available_providers():
             cuda_opts = {
-                # Big conv nets at fixed input size: let cuDNN benchmark once, then reuse.
-                "cudnn_conv_algo_search": "EXHAUSTIVE",
+                # EXHAUSTIVE benchmarking tries algorithms that need GB-sized workspaces and
+                # keeps the winners' workspace around; that alone was enough to run a
+                # 2048 px model out of VRAM. HEURISTIC picks well with no trial allocations.
+                "cudnn_conv_algo_search": "HEURISTIC",
+                "cudnn_conv_use_max_workspace": "0",
+                # Grow the arena by exactly what is asked, so shrinkage can return it.
                 "arena_extend_strategy": "kSameAsRequested",
             }
             providers = [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]

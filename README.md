@@ -173,8 +173,13 @@ sure "Add Python to environment variables" is ticked. Then reopen PowerShell.
 Install the Microsoft Visual C++ Redistributable (x64) from
 <https://aka.ms/vs/17/release/vc_redist.x64.exe>, then restart PowerShell.
 
-**"out of memory" errors on very large photos**
-The top people model needs a fair amount of graphics memory. Use the smaller one:
+**"out of memory" errors**
+Cutout keeps one model on the graphics card at a time and unloads it when you
+switch between Person and Anime. If the card still runs out (other programs, such
+as games or video editors, are using it), Cutout retries once and then makes that
+cutout on the processor instead, which is slower but gives the same result. The
+photo's size doesn't matter: the models always run at a fixed size. If it keeps
+happening, the smaller people model needs much less graphics memory:
 `python -m cutout photo.jpg --model birefnet-general`
 
 **"no person model installed" (or "no anime model installed")**
