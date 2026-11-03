@@ -12,8 +12,11 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from . import debug
 
 log = logging.getLogger(__name__)
 
@@ -162,7 +165,7 @@ def create_session(model_path: Path, device: str = "auto"):
 
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    opts.log_severity_level = 3
+    opts.log_severity_level = debug.ort_log_severity()
 
     providers: list = ["CPUExecutionProvider"]
     want_cuda = device in ("auto", "cuda")
@@ -178,8 +181,12 @@ def create_session(model_path: Path, device: str = "auto"):
         elif device == "cuda":
             raise DeviceUnavailable("onnxruntime was built without CUDA support")
 
+    debug.log_memory(f"before loading {Path(model_path).name}")
+    t0 = time.perf_counter()
     session = ort.InferenceSession(str(model_path), sess_options=opts, providers=providers)
     active = session.get_providers()[0]
+    log.info("loaded %s on %s in %.1fs", Path(model_path).name, active, time.perf_counter() - t0)
+    debug.log_memory(f"after loading {Path(model_path).name}")
     if want_cuda and active != "CUDAExecutionProvider":
         if device == "cuda":
             raise DeviceUnavailable(

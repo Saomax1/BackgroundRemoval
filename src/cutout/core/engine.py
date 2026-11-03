@@ -12,6 +12,7 @@ its main thread. Sessions are created lazily and cached, because loading a
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -21,6 +22,7 @@ from typing import Callable
 
 import numpy as np
 
+from . import debug
 from .imageio import LoadedImage, load_image, save_png
 from .models import (
     ModelSpec,
@@ -35,6 +37,8 @@ from .models import (
 from .prompt_segmenter import OnnxSamSegmenter, PromptSegmenter
 from .refine import RefineOptions, compose_rgba, refine_alpha
 from .segmenter import OnnxSegmenter, Segmenter
+
+log = logging.getLogger(__name__)
 
 SegmenterFactory = Callable[[ModelSpec, Path, str], Segmenter]
 PromptSegmenterFactory = Callable[[PromptModelSpec, Path, Path, str], PromptSegmenter]
@@ -118,6 +122,7 @@ class CutoutEngine:
             image = load_image(image)
         timings["load"] = time.perf_counter() - t0
 
+        log.info("removing background: %dx%d px, subject %s", image.width, image.height, subject.value)
         seg = self.segmenter_for(subject, model_id)
         t1 = time.perf_counter()
         coarse = seg.predict(image.as_uint8())
@@ -129,6 +134,9 @@ class CutoutEngine:
 
         info = getattr(seg, "session_info", None)
         device = "gpu" if (info is not None and info.on_gpu) else ("cpu" if info is not None else "n/a")
+        log.info("cutout done: model %s on %s, %s", seg.name, device,
+                 ", ".join(f"{k} {v:.2f}s" for k, v in timings.items()))
+        debug.log_memory("after cutout")
         return CutoutResult(
             image=image,
             alpha=alpha,

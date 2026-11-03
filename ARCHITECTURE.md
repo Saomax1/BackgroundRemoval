@@ -87,6 +87,7 @@ src/cutout/
     refine.py      upsample, guided filter, foreground estimation, compose
     engine.py      CutoutEngine: the public API the UI and CLI use
     prompt_segmenter.py  PromptSegmenter protocol + OnnxSamSegmenter (click-to-select model)
+    debug.py       log files, debug mode, crash detection, memory snapshots, the debug report
   cli.py           command-line front end (dev, benchmarks, installer smoke test)
   editing/         touch-up tools, pure NumPy/OpenCV on the alpha matte, no Qt
     matte.py       MatteEditor: brush strokes, merging masks, tile-based undo (Patch, EditHistory)

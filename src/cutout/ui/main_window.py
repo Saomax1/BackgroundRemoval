@@ -48,6 +48,7 @@ from ..core.engine import CutoutEngine, CutoutResult
 from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, load_image, save_png
 from ..core.models import REGISTRY, ModelNotInstalled, Subject
 from ..core.refine import compose_rgba
+from . import debug_menu
 from .canvas import Backdrop, CutoutCanvas
 from .document import CutoutDocument
 from .tools import CanvasTool, PanTool, ToolContext
@@ -211,6 +212,7 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_menus()
         self._build_statusbar()
+        debug_menu.install(self)
 
         self.doc.image_changed.connect(self._on_image_changed)
         self.doc.result_changed.connect(self._on_result_changed)
@@ -798,7 +800,7 @@ class MainWindow(QMainWindow):
         self.task_failed.emit(f"{title}: {message}")
         self.statusBar().showMessage(title, 6000)
         if self.ask_user:
-            QMessageBox.warning(self, title, message)
+            debug_menu.show_error(self, title, message, exc)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.is_busy and self.ask_user:
