@@ -19,6 +19,7 @@ Nothing here imports Qt, so the CLI and the frozen entry point can use it too.
 
 from __future__ import annotations
 
+import collections
 import faulthandler
 import logging
 import logging.handlers
@@ -393,10 +394,29 @@ def _app_version() -> str:
 
 
 def system_summary_line() -> str:
+    from .parallel import cpu_threads
+
     return (
         f"{platform.platform()} | Python {platform.python_version()} | "
-        f"frozen={bool(getattr(sys, 'frozen', False))} | CPUs {os.cpu_count()}"
+        f"frozen={bool(getattr(sys, 'frozen', False))} | CPUs {os.cpu_count()} "
+        f"(using {cpu_threads()} threads for full-size steps)"
     )
+
+
+# The last few cutouts and saves, step by step, for the report's "Timings" section.
+_timings: collections.deque[str] = collections.deque(maxlen=12)
+
+
+def record_timings(what: str, steps: dict[str, float], **details) -> None:
+    """Remember how long each step of a cutout or save took (shown in the debug report)."""
+    line = f"{time.strftime('%H:%M:%S')} {what}: " + ", ".join(f"{k} {v:.2f}s" for k, v in steps.items())
+    if details:
+        line += " | " + ", ".join(f"{k} {v}" for k, v in details.items())
+    _timings.append(line)
+
+
+def recent_timings() -> list[str]:
+    return list(_timings)
 
 
 def _anonymise(text: str) -> str:
@@ -434,6 +454,7 @@ def build_report(extra: str = "", models_dir: str | os.PathLike | None = None) -
     ]
     if extra:
         out.append(_section("What happened", extra))
+    out.append(_section("Timings (most recent last)", "\n".join(_timings) or "no cutout or save yet"))
 
     try:
         out.append(_section("Memory", memory_snapshot()))

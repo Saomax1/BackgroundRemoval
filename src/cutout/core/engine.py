@@ -15,10 +15,17 @@ anime model together do not fit on a typical gaming card. If a run still runs
 out of GPU memory, the engine unloads everything, retries once on the GPU, and
 then (with ``device="auto"``) runs that one image on the CPU and says so in
 ``CutoutResult.notice``. The output resolution never changes.
+
+CPU and GPU work in tandem: while the GPU runs the network, a CPU thread prepares
+the photo-only half of the full-resolution refine and colour clean-up
+(``refine.prepare_image``), and every full-resolution step runs on all cores. The
+click-to-select model runs on the CPU by default (``select_device``), so it never
+competes with the automatic-removal model for graphics memory.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import logging
 import os
@@ -42,7 +49,8 @@ from .models import (
     resolve_prompt_model,
 )
 from .prompt_segmenter import OnnxSamSegmenter, PromptSegmenter
-from .refine import RefineOptions, compose_rgba, refine_alpha
+from . import debug, parallel
+from .refine import ImagePrep, RefineOptions, compose_rgba, prepare_image, refine_alpha
 from .runtime import GpuOutOfMemory, is_out_of_memory
 from .segmenter import OnnxSegmenter, Segmenter
 
@@ -68,9 +76,11 @@ class CutoutResult:
     decontaminate: bool = True
     # Set when something unusual happened that the user should hear about (e.g. CPU fallback).
     notice: str | None = None
+    # Photo-only precomputation, reused when composing this image for saving.
+    prep: ImagePrep | None = field(default=None, repr=False, compare=False)
 
     def to_rgba(self) -> np.ndarray:
-        return compose_rgba(self.image, self.alpha, self.decontaminate)
+        return compose_rgba(self.image, self.alpha, self.decontaminate, self.prep)
 
     def save_png(self, path: str | os.PathLike) -> None:
         save_png(path, self.to_rgba(), self.image.icc_profile)
@@ -84,9 +94,14 @@ class CutoutEngine:
         refine: RefineOptions = RefineOptions(),
         segmenter_factory: SegmenterFactory | None = None,
         prompt_segmenter_factory: PromptSegmenterFactory | None = None,
+        select_device: str | None = None,
     ):
         self.models_dir = Path(models_dir) if models_dir else default_models_dir()
         self.device = device
+        # Click-to-select runs on the CPU unless asked otherwise: its heavy encoder runs
+        # once per image in the background, its per-click decoder is small, and keeping it
+        # off the GPU leaves all graphics memory to the automatic-removal model.
+        self.select_device = select_device or os.environ.get("CUTOUT_SELECT_DEVICE", "").strip() or "cpu"
         self.refine = refine
         self._factory: SegmenterFactory = segmenter_factory or OnnxSegmenter
         self._segmenters: dict[str, Segmenter] = {}
@@ -134,7 +149,8 @@ class CutoutEngine:
             seg = self._prompt_segmenters.get(spec.id)
             if seg is None:
                 enc, dec = prompt_model_paths(spec, self.models_dir)
-                seg = self._prompt_factory(spec, enc, dec, self.device)
+                device = "cpu" if self.device == "cpu" else self.select_device
+                seg = self._prompt_factory(spec, enc, dec, device)
                 self._prompt_segmenters[spec.id] = seg
         return seg
 
@@ -163,6 +179,9 @@ class CutoutEngine:
         timings["load"] = time.perf_counter() - t0
 
         spec = resolve_model(subject, self.models_dir, model_id)
+        # CPU side of the tandem: prepare the photo-only half of the refine while the
+        # GPU runs the network (ONNX Runtime releases the GIL during the run).
+        prep_future = parallel.submit(_timed_prep, image, self.refine)
         rgb = image.as_uint8()
         notice = None
         t1 = time.perf_counter()
@@ -183,11 +202,18 @@ class CutoutEngine:
         del rgb
 
         t2 = time.perf_counter()
-        alpha = refine_alpha(image, coarse, self.refine)
-        timings["refine"] = time.perf_counter() - t2
-
+        prep, prep_seconds = prep_future.result()
+        timings["refine"] = time.perf_counter() - t2  # includes any wait for the CPU prep
+        t3 = time.perf_counter()
+        alpha = refine_alpha(image, coarse, self.refine, prep)
+        timings["refine"] += time.perf_counter() - t3
         info = getattr(seg, "session_info", None)
         device = "gpu" if (info is not None and info.on_gpu) else ("cpu" if info is not None else "n/a")
+        debug.record_timings(
+            f"cutout {image.width}x{image.height}", timings, model=seg.name, device=device,
+            cpu_prep_alongside_model=f"{prep_seconds:.2f}s", cpu_threads=parallel.cpu_threads(),
+        )
+
         return CutoutResult(
             image=image,
             alpha=alpha,
@@ -196,6 +222,8 @@ class CutoutEngine:
             timings=timings,
             decontaminate=self.refine.decontaminate,
             notice=notice,
+            # Keep only what saving needs; the full-size guide image is not worth holding.
+            prep=dataclasses.replace(prep, gray=None, guide=None),
         )
 
     def _predict_after_oom(
@@ -237,3 +265,9 @@ class CutoutEngine:
                    "Close other programs that use it and try again.")
         log.error("giving up on %s: %s", spec.id, last)
         raise GpuOutOfMemory(msg)
+
+
+def _timed_prep(image: LoadedImage, opts: RefineOptions) -> tuple[ImagePrep, float]:
+    t = time.perf_counter()
+    prep = prepare_image(image, opts)
+    return prep, time.perf_counter() - t
