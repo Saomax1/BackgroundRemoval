@@ -75,10 +75,20 @@ def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int, eps: float, s
     return mean_a * guide + mean_b
 
 
-def guided_refine(gray: np.ndarray, alpha: np.ndarray, opts: RefineOptions = RefineOptions()) -> np.ndarray:
-    """``gray``: float32 HxW luminance in [0, 1] at full resolution, used as the guide."""
+def guided_refine(
+    gray: np.ndarray,
+    alpha: np.ndarray,
+    opts: RefineOptions = RefineOptions(),
+    reference_size: int | None = None,
+) -> np.ndarray:
+    """``gray``: float32 HxW luminance in [0, 1] at full resolution, used as the guide.
+
+    ``reference_size`` is the long side of the whole image when ``gray``/``alpha`` are a
+    crop of it (the touch-up tools refine only the area they change), so the filter
+    radius matches what the full-image refine would use.
+    """
     h, w = alpha.shape
-    long_side = max(h, w)
+    long_side = reference_size or max(h, w)
     radius = max(2, round(long_side * opts.radius_frac))
     subsample = max(1, min(radius // 2, long_side // 2048))
 
