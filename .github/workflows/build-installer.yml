@@ -1,8 +1,11 @@
 name: windows installer
 
-# Builds Cutout-Setup-<version>.exe: PyInstaller app + CUDA/cuDNN DLLs + AI models,
-# wrapped by Inno Setup, then installs it silently on a clean runner and runs it.
-# Download the result from the run's "Artifacts" section.
+# Builds Cutout: PyInstaller app + CUDA/cuDNN DLLs + AI models, split into update packs
+# (packaging/make_release.py), plus a small Cutout-Setup-<version>.exe that downloads the
+# GPU runtime and models on first start. On a clean runner it installs Setup, finishes the
+# install and applies an update the way the app does, then runs real cutouts.
+# Every push to main publishes the result as a GitHub release, which is where the app's
+# Help > Check for Updates looks. Pull requests only build and test.
 
 on:
   workflow_dispatch:
@@ -21,7 +24,8 @@ on:
 
 concurrency:
   group: installer-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a main build half-way through publishing its release.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   PYTHON_VERSION: "3.12"
@@ -123,7 +127,12 @@ jobs:
     # Ship without click-to-select rather than not at all if only the SAM export failed.
     if: ${{ !cancelled() && needs.models.result == 'success' }}
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
+    permissions:
+      contents: write  # create the release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PUBLISH: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
     defaults:
       run:
         shell: pwsh
@@ -132,10 +141,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+      - name: Set the version
+        run: python packaging/set_version.py ${{ github.run_number }}
       - name: Install app with GPU runtime and build tools
         run: |
           python -m pip install --upgrade pip
-          # The ui extra arrives with the editor window; pip only warns while it is missing.
           pip install -e ".[gpu,ui,build,dev]"
       - name: Unit tests
         run: python -m pytest -q
@@ -161,13 +171,37 @@ jobs:
       - name: Stage click-to-select model
         run: |
           $files = Get-ChildItem build/prompt-models/*.onnx -ErrorAction SilentlyContinue
-          if (-not $files) { "::warning::No click-to-select model; the installer ships without it."; exit 0 }
+          if (-not $files) { "::warning::No click-to-select model; this build ships without it."; exit 0 }
           $files | ForEach-Object { Copy-Item $_ dist/Cutout/models/; "staged {0} ({1:N0} MB)" -f $_.Name, ($_.Length / 1MB) }
 
       - name: Report app size
         run: |
           $mb = (Get-ChildItem dist/Cutout -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
           "dist/Cutout: {0:N0} MB" -f $mb
+
+      - name: Previous release (unchanged parts keep its downloads)
+        run: |
+          gh release download --repo ${{ github.repository }} --pattern cutout-release.json --dir build/prev
+          if ($LASTEXITCODE) { "no earlier release found: every part is uploaded" }
+          exit 0
+      - name: Release notes
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          if ($env:PUBLISH -eq 'true') {
+            gh api repos/${{ github.repository }}/releases/generate-notes -f tag_name="v$env:VERSION" -f target_commitish="${{ github.sha }}" --jq .body > build/notes.md
+            if ($LASTEXITCODE) { "Cutout $env:VERSION" > build/notes.md }
+          } else {
+            "Test build of ${{ github.ref_name }} (not published)." > build/notes.md
+          }
+          Get-Content build/notes.md
+          exit 0
+      - name: Make update packs and Setup input
+        run: |
+          $prev = if (Test-Path build/prev/cutout-release.json) { @("--previous", "build/prev/cutout-release.json") } else { @() }
+          python packaging/make_release.py dist/Cutout dist/release --version $env:VERSION `
+            --base-url "https://github.com/${{ github.repository }}/releases/download/v$env:VERSION" `
+            --notes-file build/notes.md --setup-dir dist/setup @prev
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Install Inno Setup
         run: |
@@ -180,29 +214,45 @@ jobs:
 
       - name: Build Setup.exe
         run: |
-          $version = python -c "import cutout; print(cutout.__version__)"
-          & $env:ISCC /Qp "/DAppVersion=$version" packaging\cutout.iss
+          & $env:ISCC /Qp "/DAppVersion=$env:VERSION" "/DFirstRunGB=$env:FIRST_RUN_GB" packaging\cutout.iss
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $setup = Get-ChildItem dist/installer/*.exe | Select-Object -First 1
-          "{0}: {1:N2} GB" -f $setup.Name, ($setup.Length / 1GB)
-          if ($setup.Length -gt 4.2e9) { throw "Setup.exe is over the ~4 GB single-file limit" }
+          "{0}: {1:N0} MB" -f $setup.Name, ($setup.Length / 1MB)
+          if ($setup.Length -gt 2.0e9) { throw "Setup.exe is over GitHub's 2 GB release file limit" }
           "SETUP=$($setup.FullName)" >> $env:GITHUB_ENV
 
-      - name: Smoke test the installed app
+      - name: Smoke test - install, finish setup, cut out, update
         run: |
           $dir = Join-Path $env:RUNNER_TEMP "CutoutInstall"
-          $p = Start-Process $env:SETUP -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER","/DIR=`"$dir`"","/LOG=`"$env:RUNNER_TEMP\setup.log`"" -Wait -PassThru
+          $cli = Join-Path $dir "cutout-cli.exe"
+          $result = Join-Path $env:LOCALAPPDATA "Cutout\updates\last-result.json"
+          function Wait-Update {
+            for ($i = 0; $i -lt 600 -and -not (Test-Path $result); $i++) { Start-Sleep -Milliseconds 500 }
+            if (-not (Test-Path $result)) { throw "the update helper never finished" }
+            $r = Get-Content $result -Raw | ConvertFrom-Json
+            if (-not $r.ok) { Get-Content $r.log -ErrorAction SilentlyContinue; throw "update failed: $($r.message)" }
+            Remove-Item $result
+          }
+
+          $p = Start-Process $env:SETUP -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=`"$dir`"","/LOG=`"$env:RUNNER_TEMP\setup.log`"" -Wait -PassThru
           if ($p.ExitCode) { Get-Content "$env:RUNNER_TEMP\setup.log" -Tail 40; throw "setup exited $($p.ExitCode)" }
-          foreach ($f in "Cutout.exe", "cutout-cli.exe", "models") {
+          foreach ($f in "Cutout.exe", "cutout-cli.exe", "release.json") {
             if (-not (Test-Path (Join-Path $dir $f))) { throw "missing $f after install" }
           }
-          $cli = Join-Path $dir "cutout-cli.exe"
+
+          "--- first start: fetch the GPU runtime and models (from this build's files, same code path as a download)"
+          & $cli --version
+          & $cli --update --manifest (Join-Path $dir "release.json") --from-dir dist/release
+          if ($LASTEXITCODE) { throw "finishing the install failed" }
+          Wait-Update
+          $v = & $cli --version | Out-String
+          $v
+          if ($v -match "missing:") { throw "parts still missing after finishing the install" }
 
           $diag = & $cli --diagnose | Out-String
           $diag
-          # No GPU on the runner, but every CUDA/cuDNN DLL must still resolve from the bundle.
+          # No GPU on the runner, but every CUDA/cuDNN DLL must still resolve from the install.
           if ($diag -notmatch "CUDA provider DLL loads: yes") { throw "CUDA DLLs are not loadable from the install" }
-
           & $cli --list-models
           if ($LASTEXITCODE) { throw "--list-models failed" }
 
@@ -215,9 +265,43 @@ jobs:
             if ($LASTEXITCODE) { throw "$subject output is wrong" }
           }
 
+          "--- update: a newer version where only the app part changed"
+          "ci" | Set-Content dist/Cutout/_internal/cutout/ci-update-marker.txt
+          python packaging/make_release.py dist/Cutout dist/release-next --version "$env:VERSION.1" `
+            --base-url "https://example.invalid/next" --previous dist/release/cutout-release.json --skip-reused
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $check = & $cli --check-updates --manifest dist/release-next/cutout-release.json | Out-String
+          $check
+          if ($check -notmatch "in 1 part") { throw "expected only the app part to change" }
+          & $cli --update --manifest dist/release-next/cutout-release.json --from-dir dist/release-next
+          if ($LASTEXITCODE) { throw "update failed to start" }
+          Wait-Update
+          if (-not (Test-Path (Join-Path $dir "_internal/cutout/ci-update-marker.txt"))) { throw "update did not install the new file" }
+          $v = & $cli --version | Out-String
+          $v
+          if ($v -notmatch "installed release $([regex]::Escape("$env:VERSION.1"))") { throw "version not updated" }
+          & $cli "$env:RUNNER_TEMP\sample.png" --subject anime --device cpu -o "$env:RUNNER_TEMP\after_update.png"
+          if ($LASTEXITCODE) { throw "cutout after update failed" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: Cutout-Setup
           path: dist/installer/*.exe
           compression-level: 0
-          retention-days: 30
+          retention-days: 14
+
+      - name: Publish GitHub release
+        if: env.PUBLISH == 'true'
+        run: |
+          $tag = "v$env:VERSION"
+          $repo = "${{ github.repository }}"
+          $files = @(Get-Content dist/release/upload.txt | Where-Object { $_ -and $_ -notlike '*cutout-release.json' })
+          gh release create $tag --repo $repo --draft --title "Cutout $env:VERSION" --notes-file build/notes.md --target ${{ github.sha }} $env:SETUP @files
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # The manifest goes up last and the release only becomes visible once every file
+          # is there, so the app never sees a half-uploaded release.
+          gh release upload $tag dist/release/cutout-release.json --repo $repo
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh release edit $tag --repo $repo --draft=false --latest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "published https://github.com/$repo/releases/tag/$tag"

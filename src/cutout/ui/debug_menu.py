@@ -36,6 +36,7 @@ def saved_preference(settings) -> bool:
 def install(window: "MainWindow") -> None:
     mb = window.menuBar()
     m = mb.addMenu("&Help")
+    window.help_menu = m  # update_ui adds the update items below these
 
     act_debug = QAction("Debug Mode", window)
     act_debug.setCheckable(True)

@@ -35,5 +35,9 @@ cutout-gui = "cutout.ui:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# The helper that swaps files after the app closes (cutout.update.client.launch_apply).
+"cutout.update" = ["*.ps1"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

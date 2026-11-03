@@ -17,7 +17,7 @@ from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
 from ..core import debug
-from . import debug_menu
+from . import debug_menu, update_ui
 from .main_window import APP_NAME, MainWindow
 
 ACCENT = "#5b8def"
@@ -149,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     window = MainWindow()
     window.show()
     QTimer.singleShot(0, lambda: debug_menu.offer_crash_report(window))
+    QTimer.singleShot(0, lambda: update_ui.on_startup(window))
     window.warmup_in_background()
 
     files = [a for a in args if not a.startswith("-")]
