@@ -17,6 +17,7 @@ from pathlib import Path
 from .core.engine import CutoutEngine
 from .core.models import REGISTRY, Subject, default_models_dir, installed_models
 from .core.refine import RefineOptions
+from .core.runtime import diagnose
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-refine", action="store_true", help="skip guided edge refinement")
     p.add_argument("--no-decontaminate", action="store_true", help="skip edge colour cleanup")
     p.add_argument("--list-models", action="store_true", help="show known and installed models")
+    p.add_argument("--diagnose", action="store_true", help="print GPU/CUDA setup details and exit")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -38,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(message)s")
     models_dir = args.models_dir or default_models_dir()
+
+    if args.diagnose:
+        print("\n".join(diagnose()))
+        return 0
 
     if args.list_models:
         have = {s.id for s in installed_models(models_dir)}

@@ -1,8 +1,8 @@
 """Export BiRefNet-family PyTorch checkpoints to ONNX (build machine only, needs internet + torch).
 
-    pip install torch torchvision transformers timm kornia einops deform_conv2d_onnx_exporter
+    pip install -r packaging/requirements-export.txt
     python scripts/export_birefnet_onnx.py birefnet-hr-matting
-    python scripts/export_birefnet_onnx.py toonout --weights path/to/birefnet_finetuned_toonout.pth
+    python scripts/export_birefnet_onnx.py toonout   # downloads birefnet_finetuned_toonout.pth
 
 The exported graph ends in a sigmoid, so it outputs alpha in [0, 1] directly.
 BiRefNet uses deformable convolutions, which plain ``torch.onnx`` cannot export;
@@ -42,6 +42,12 @@ def main() -> int:
     register_deform_conv2d_onnx_op()
     spec = REGISTRY[args.model_id]
     repo = spec.export_source.removeprefix("hf:")
+    if repo.endswith((".pth", ".pt")) and not args.weights:
+        # "owner/repo/file.pth": a fine-tuned state dict published on the Hub (ToonOut).
+        from huggingface_hub import hf_hub_download
+
+        owner, name, filename = repo.split("/", 2)
+        args.weights = Path(hf_hub_download(f"{owner}/{name}", filename))
 
     if args.weights:
         net = AutoModelForImageSegmentation.from_pretrained(BASE_ARCH_REPO, trust_remote_code=True)

@@ -5,7 +5,8 @@ Drop in a photo of a person or an anime character and get a transparent PNG at
 exactly the same resolution, with clean hair and soft edges.
 
 Status: the core engine and a command-line tool are in place. The desktop UI,
-touch-up tools (brush, click-to-select) and the Windows installer are next.
+touch-up tools (brush, click-to-select) are next. The Windows installer is
+built by GitHub Actions; see [packaging/README.md](packaging/README.md).
 See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Quick start (development)
