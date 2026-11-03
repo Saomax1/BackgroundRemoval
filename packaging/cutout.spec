@@ -19,9 +19,11 @@ def nvidia_dlls():
     spec = importlib.util.find_spec("nvidia")
     if spec is None or not spec.submodule_search_locations:
         raise SystemExit("nvidia-* CUDA wheels not installed: pip install -e .[gpu,build]")
+    # Layouts differ by CUDA major: 12.x wheels use nvidia/<lib>/bin/*.dll, 13.x wheels
+    # use nvidia/cu13/bin/x86_64/*.dll. Search the whole tree so either works.
     found = {}
     for root in spec.submodule_search_locations:
-        for dll in sorted(Path(root).glob("*/bin/*.dll")):
+        for dll in sorted(Path(root).rglob("*.dll")):
             found.setdefault(dll.name.lower(), dll)
     if not any(n.startswith("cudnn64_") for n in found) or not any(n.startswith("cudart64_") for n in found):
         raise SystemExit(f"CUDA runtime or cuDNN DLLs missing; found only {sorted(found)}")
@@ -50,6 +52,9 @@ def analysis(script):
 
 gui_a = analysis("entry_gui.py")
 cli_a = analysis("entry_cli.py")
+# The TensorRT provider needs TensorRT itself (not shipped, not used): leave it out.
+for a in (gui_a, cli_a):
+    a.binaries = [b for b in a.binaries if "providers_tensorrt" not in b[0].lower()]
 
 gui_exe = EXE(
     PYZ(gui_a.pure),

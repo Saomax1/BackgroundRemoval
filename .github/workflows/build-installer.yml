@@ -14,6 +14,7 @@ on:
       - "packaging/**"
       - "scripts/**"
       - "src/cutout/core/models.py"
+      - "src/cutout/core/prompt_segmenter.py"
       - "src/cutout/core/runtime.py"
       - "pyproject.toml"
       - ".github/workflows/build-installer.yml"
@@ -38,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: key
-        run: echo "key=models-${{ env.MODELS_CACHE_SALT }}-${{ hashFiles('src/cutout/core/models.py', 'scripts/export_birefnet_onnx.py', 'scripts/build_models.py', 'scripts/fetch_models.py', 'packaging/requirements-export.txt') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=models-${{ env.MODELS_CACHE_SALT }}-${{ hashFiles('src/cutout/core/models.py', 'scripts/export_birefnet_onnx.py', 'scripts/onnx_deform_conv.py', 'scripts/build_models.py', 'scripts/fetch_models.py', 'packaging/requirements-export.txt') }}" >> "$GITHUB_OUTPUT"
       - id: cache
         uses: actions/cache/restore@v4
         with:
@@ -62,6 +63,9 @@ jobs:
       - name: Install export toolchain
         if: steps.cache.outputs.cache-hit != 'true'
         run: pip install -e ".[cpu]" -r packaging/requirements-export.txt
+      - name: Check the ONNX deformable-conv replacement against torchvision
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python scripts/onnx_deform_conv.py
       - name: Build and check models
         if: steps.cache.outputs.cache-hit != 'true'
         run: python scripts/build_models.py --models-dir build/models
@@ -75,8 +79,49 @@ jobs:
           key: ${{ steps.key.outputs.key }}
           enableCrossOsArchive: true
 
+  prompt-models:
+    # Click-to-select (SAM 2.1). Separate job and cache so a failure here only leaves
+    # click-to-select out of the installer instead of blocking it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: key
+        run: echo "key=prompt-models-${{ env.MODELS_CACHE_SALT }}-${{ hashFiles('src/cutout/core/models.py', 'src/cutout/core/prompt_segmenter.py', 'scripts/export_sam2_onnx.py', 'scripts/build_prompt_models.py') }}" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/prompt-models
+          key: ${{ steps.key.outputs.key }}
+          enableCrossOsArchive: true
+          lookup-only: true
+      - uses: actions/setup-python@v5
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install SAM 2 export toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          SAM2_BUILD_CUDA: "0"
+        run: |
+          pip install -e ".[cpu]" onnx huggingface_hub torch==2.5.1 torchvision==0.20.1 --extra-index-url https://download.pytorch.org/whl/cpu
+          pip install --no-build-isolation "git+https://github.com/facebookresearch/sam2.git"
+      - name: Export and check click-to-select model
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python scripts/build_prompt_models.py --models-dir build/prompt-models
+      - uses: actions/cache/save@v4
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: build/prompt-models
+          key: ${{ steps.key.outputs.key }}
+          enableCrossOsArchive: true
+
   installer:
-    needs: models
+    needs: [models, prompt-models]
+    # Ship without click-to-select rather than not at all if only the SAM export failed.
+    if: ${{ !cancelled() && needs.models.result == 'success' }}
     runs-on: windows-latest
     timeout-minutes: 120
     defaults:
@@ -106,6 +151,18 @@ jobs:
           fail-on-cache-miss: true
       - name: Stage models
         run: python packaging/stage_models.py build/models dist/Cutout/models
+
+      - uses: actions/cache/restore@v4
+        if: needs.prompt-models.result == 'success'
+        with:
+          path: build/prompt-models
+          key: ${{ needs.prompt-models.outputs.key }}
+          enableCrossOsArchive: true
+      - name: Stage click-to-select model
+        run: |
+          $files = Get-ChildItem build/prompt-models/*.onnx -ErrorAction SilentlyContinue
+          if (-not $files) { "::warning::No click-to-select model; the installer ships without it."; exit 0 }
+          $files | ForEach-Object { Copy-Item $_ dist/Cutout/models/; "staged {0} ({1:N0} MB)" -f $_.Name, ($_.Length / 1MB) }
 
       - name: Report app size
         run: |

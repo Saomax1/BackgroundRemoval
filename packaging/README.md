@@ -24,9 +24,14 @@ not code-signed: click "More info" then "Run anyway".
    and recorded in `manifest.json`; the build fails only if a subject (person or
    anime) ends up with no working model. The cache key is a hash of the model
    recipe files, so this slow job only reruns when they change.
-2. **installer** job (Windows):
+2. **prompt-models** job (Linux, cached): `scripts/build_prompt_models.py`
+   exports the click-to-select model (SAM 2.1 Hiera-B+) and checks that one
+   click selects a test shape. If it fails, the installer still builds, just
+   without click-to-select.
+3. **installer** job (Windows):
    * `pip install -e .[gpu,ui,build]` pulls `onnxruntime-gpu` plus the
-     `nvidia-*` CUDA/cuDNN wheels.
+     `nvidia-*` CUDA/cuDNN wheels (CUDA 13 since onnxruntime-gpu 1.2x; the spec
+     finds DLLs anywhere under `site-packages/nvidia`, whatever the layout).
    * `pyinstaller packaging/cutout.spec` makes `dist/Cutout/` with `Cutout.exe`
      (window) and `cutout-cli.exe` (console), and copies every CUDA/cuDNN DLL
      flat into `_internal/nvidia_dlls/`. At startup `cutout.core.runtime` puts

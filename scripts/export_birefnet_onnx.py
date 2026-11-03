@@ -5,9 +5,10 @@
     python scripts/export_birefnet_onnx.py toonout   # downloads birefnet_finetuned_toonout.pth
 
 The exported graph ends in a sigmoid, so it outputs alpha in [0, 1] directly.
-BiRefNet uses deformable convolutions, which plain ``torch.onnx`` cannot export;
-``deform_conv2d_onnx_exporter`` registers a symbolic for them (this is the route
-BiRefNet's own ONNX tutorial uses).
+BiRefNet uses deformable convolutions, which ONNX has no op for. Before export
+they are swapped for an equivalent built from ``grid_sample`` (see
+``onnx_deform_conv.py``; the ``deform_conv2d_onnx_exporter`` route failed on
+the HR-matting and ToonOut code because it needs static shapes).
 
 Status: written for the build pipeline, not yet run end-to-end (the dev sandbox
 that produced it has no access to Hugging Face). Validate the exported file with
@@ -21,6 +22,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cutout.core.models import REGISTRY, default_models_dir, model_path  # noqa: E402
 
@@ -32,14 +34,15 @@ def main() -> int:
     ap.add_argument("model_id", choices=[s.id for s in REGISTRY.values() if s.export_source])
     ap.add_argument("--weights", type=Path, help="local .pth state dict (for fine-tunes such as ToonOut)")
     ap.add_argument("--models-dir", type=Path, default=default_models_dir())
-    ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--opset", type=int, default=17)  # GridSample needs 16+
     args = ap.parse_args()
 
     import torch
-    from deform_conv2d_onnx_exporter import register_deform_conv2d_onnx_op
     from transformers import AutoModelForImageSegmentation
 
-    register_deform_conv2d_onnx_op()
+    import onnx_deform_conv
+
+    onnx_deform_conv.install()  # before loading, for modules that import the op lazily
     spec = REGISTRY[args.model_id]
     repo = spec.export_source.removeprefix("hf:")
     if repo.endswith((".pth", ".pt")) and not args.weights:
@@ -60,6 +63,10 @@ def main() -> int:
     else:
         net = AutoModelForImageSegmentation.from_pretrained(repo, trust_remote_code=True)
     net.eval().requires_grad_(False)
+    swapped = onnx_deform_conv.install()
+    print(f"deformable conv swapped for the ONNX-friendly version in {swapped} module(s)")
+    if swapped == 0:
+        print("warning: no module imports torchvision's deform_conv2d; export may fail", file=sys.stderr)
 
     class Final(torch.nn.Module):
         def __init__(self, inner):
