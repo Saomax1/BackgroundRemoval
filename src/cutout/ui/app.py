@@ -1,20 +1,23 @@
 """App entry point: theme, QApplication, main window.
 
-    python -m cutout.ui [image]
+    python -m cutout.ui [--debug] [image]
     cutout-gui [image]
     from cutout.ui import main; main(["photo.jpg"])   # what the packaged Cutout.exe does
 """
 
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+import logging
+
+from PySide6.QtCore import QSettings, Qt, QTimer, QtMsgType, qInstallMessageHandler
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
+from ..core import debug
+from . import debug_menu
 from .main_window import APP_NAME, MainWindow
 
 ACCENT = "#5b8def"
@@ -114,9 +117,27 @@ def _set_windows_app_id() -> None:
             pass
 
 
+_QT_LEVELS = {
+    QtMsgType.QtDebugMsg: logging.DEBUG,
+    QtMsgType.QtInfoMsg: logging.INFO,
+    QtMsgType.QtWarningMsg: logging.WARNING,
+    QtMsgType.QtCriticalMsg: logging.ERROR,
+    QtMsgType.QtFatalMsg: logging.CRITICAL,
+}
+
+
+def _qt_message(mode, _context, message) -> None:
+    logging.getLogger("qt").log(_QT_LEVELS.get(mode, logging.INFO), "%s", message)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    debug_flag = "--debug" in args
+    args = [a for a in args if a != "--debug"]
+    # The saved Help > Debug Mode choice is read before Qt starts, so the whole run is logged.
+    saved = debug_menu.saved_preference(QSettings(APP_NAME, APP_NAME))
+    debug.setup(debug=debug_flag or saved or debug.env_requests_debug())
+    qInstallMessageHandler(_qt_message)
     _set_windows_app_id()
     app = QApplication.instance() or QApplication([sys.argv[0], *[a for a in args if a.startswith("-")]])
     app.setApplicationName(APP_NAME)
@@ -127,13 +148,16 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow()
     window.show()
+    QTimer.singleShot(0, lambda: debug_menu.offer_crash_report(window))
     window.warmup_in_background()
 
     files = [a for a in args if not a.startswith("-")]
     if files:
         path = Path(files[0])
         QTimer.singleShot(0, lambda: window.open_path(path))
-    return app.exec()
+    code = app.exec()
+    debug.mark_clean_exit()
+    return code
 
 
 if __name__ == "__main__":  # pragma: no cover

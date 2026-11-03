@@ -144,6 +144,16 @@ paste its full path instead of typing it.
 
 ## If something goes wrong
 
+**Sending a problem report.** Turn on **Help > Debug Mode** (it stays on until
+you turn it off), or start Cutout from the **Cutout (debug mode)** Start menu
+shortcut. Do the thing that failed again, then choose **Help > Copy Debug
+Report** and paste it into the chat. Error messages also have a **Copy Report**
+button, and if Cutout closed unexpectedly it offers a report the next time it
+starts. The report holds your PC and graphics card details, which model ran,
+memory use, and the recent log. Your user folder name is replaced with
+`%USERPROFILE%`. Log files are kept in `%LOCALAPPDATA%\Cutout\logs`
+(**Help > Open Log Folder**).
+
 **"running ... on CPU (this will be slow)" or `device=cpu`**
 Cutout couldn't use your graphics card. It still works, just slower. To fix it:
 

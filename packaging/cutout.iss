@@ -54,6 +54,8 @@ Type: filesandordirs; Name: "{app}\_internal"
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\Cutout.exe"
+; Same app with detailed logging, for reporting a problem (Help > Copy Debug Report).
+Name: "{autoprograms}\{#AppName} (debug mode)"; Filename: "{app}\Cutout.exe"; Parameters: "--debug"; Comment: "Start Cutout with detailed logging"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\Cutout.exe"; Tasks: desktopicon
 
 [Run]
