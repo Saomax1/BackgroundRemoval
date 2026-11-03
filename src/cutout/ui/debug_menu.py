@@ -97,7 +97,19 @@ def _log_user_actions(window: "MainWindow") -> None:
             log.info("opened image %s: %dx%d, %s", getattr(img.source_path, "name", "?"),
                      img.width, img.height, img.rgb.dtype)
 
+    def on_result():
+        res = window.doc.result
+        if res is None:
+            return
+        log.info("cutout done: %dx%d px, subject %s, model %s on %s, %s",
+                 res.image.width, res.image.height, window.subject.value, res.model_id, res.device,
+                 ", ".join(f"{k} {v:.2f}s" for k, v in res.timings.items()))
+        if debug.enabled():  # nvidia-smi takes a moment: keep it off the UI thread
+            window.run_in_background(debug.log_memory, "after cutout", on_error=lambda _e: None)
+
     window.doc.image_changed.connect(on_image)
+    window.doc.result_changed.connect(on_result)
+    window.act_rerun.triggered.connect(lambda: log.info("remove background again"))
     window.subject_group.buttonClicked.connect(lambda _b: log.info("subject set to %s", window.subject.value))
     window.cutout_ready.connect(lambda: log.info("cutout shown"))
     window.saved.connect(lambda p: log.info("saved %s", Path(p).name))

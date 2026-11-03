@@ -165,7 +165,7 @@ def create_session(model_path: Path, device: str = "auto"):
 
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    opts.log_severity_level = debug.ort_log_severity()
+    opts.log_severity_level = 3
 
     providers: list = ["CPUExecutionProvider"]
     want_cuda = device in ("auto", "cuda")
@@ -181,6 +181,7 @@ def create_session(model_path: Path, device: str = "auto"):
         elif device == "cuda":
             raise DeviceUnavailable("onnxruntime was built without CUDA support")
 
+    opts.log_severity_level = debug.ort_log_severity()  # info in debug mode, errors otherwise
     debug.log_memory(f"before loading {Path(model_path).name}")
     t0 = time.perf_counter()
     session = ort.InferenceSession(str(model_path), sess_options=opts, providers=providers)

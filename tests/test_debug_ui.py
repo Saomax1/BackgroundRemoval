@@ -13,9 +13,10 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from conftest import FakeSegmenter  # noqa: E402
 from cutout.core import debug  # noqa: E402
 from cutout.core.engine import CutoutEngine  # noqa: E402
+from cutout.core.models import REGISTRY  # noqa: E402
 from cutout.ui import debug_menu  # noqa: E402
 from cutout.ui.main_window import MainWindow  # noqa: E402
-from test_ui import wait_until  # noqa: E402
+from test_ui import _open, _photo, wait_until  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -27,7 +28,10 @@ def qapp():
 def window(qapp, tmp_path):
     debug._reset_for_tests()
     debug.setup(console=False, directory=tmp_path / "logs")
-    engine = CutoutEngine(models_dir=tmp_path / "models", segmenter_factory=FakeSegmenter)
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / REGISTRY["birefnet-general"].filename).write_bytes(b"x")
+    engine = CutoutEngine(models_dir=models, segmenter_factory=FakeSegmenter)
     settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     w = MainWindow(engine=engine, settings=settings, ask_user=False)
     w.show()
@@ -62,3 +66,13 @@ def test_save_report_writes_file(window):
     target = debug.log_dir() / "cutout-report.txt"
     wait_until(target.exists)
     assert "===== Models" in target.read_text(encoding="utf-8")
+
+
+def test_cutout_is_logged_with_size_model_and_memory(window, tmp_path):
+    debug.set_enabled(True)
+    _open(window, _photo(tmp_path, h=120, w=90))
+    log_file = debug.log_file()
+    wait_until(lambda: "memory after cutout" in log_file.read_text(encoding="utf-8"))
+    text = log_file.read_text(encoding="utf-8")
+    assert "opened image photo.png: 90x120" in text
+    assert "cutout done: 90x120 px, subject person, model fake" in text

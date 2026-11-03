@@ -58,21 +58,3 @@ def test_report_has_sections_and_hides_home_folder(logs, tmp_path, monkeypatch):
 def test_memory_snapshot_never_raises():
     line = debug.memory_snapshot()
     assert "RAM" in line or "memory" in line
-
-
-def test_engine_logs_image_size_and_model(logs, tmp_path, rng):
-    from conftest import FakeSegmenter
-    from cutout.core.engine import CutoutEngine
-    from cutout.core.imageio import LoadedImage
-    from cutout.core.models import REGISTRY, Subject
-
-    debug.setup(debug=True, console=False, directory=logs)
-    models = tmp_path / "models"
-    models.mkdir()
-    (models / REGISTRY["birefnet-general"].filename).write_bytes(b"x")
-    engine = CutoutEngine(models_dir=models, segmenter_factory=FakeSegmenter)
-    engine.remove_background(LoadedImage(rng.integers(0, 256, (120, 90, 3), dtype="uint8")), Subject.PERSON)
-    text = (logs / debug.LOG_NAME).read_text(encoding="utf-8")
-    assert "90x120 px, subject person" in text
-    assert "model fake" in text
-    assert "memory after cutout" in text
