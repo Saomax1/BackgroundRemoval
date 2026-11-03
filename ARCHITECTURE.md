@@ -26,6 +26,19 @@ runs with any subset of these files. Registry: `src/cutout/core/models.py`.
 | Anime | **ToonOut** (`toonout`) | 1024 | BiRefNet fine-tuned on anime characters; much better on line art, spiky hair and flat-shaded edges than photo-trained models. Exported from its `.pth`. |
 | Anime | ISNet anime-seg (`isnet-anime`) | 1024 | Ready-made ONNX from `skytnt/anime-seg`. Small and fast fallback. |
 
+Click-to-select uses a separate *promptable* model, picked the same way (best installed first):
+
+| Model (priority order) | Files | Approx. size | Source |
+|---|---|---|---|
+| **SAM 2.1 Hiera-L** (`sam2.1-hiera-large`) | `.encoder.onnx` + `.decoder.onnx` | ~900 MB | `facebook/sam2.1-hiera-large` |
+| SAM 2.1 Hiera-B+ (`sam2.1-hiera-base-plus`) | same | ~330 MB | `facebook/sam2.1-hiera-base-plus` |
+| SAM 2.1 Hiera-S (`sam2.1-hiera-small`) | same | ~190 MB | `facebook/sam2.1-hiera-small` |
+
+The encoder runs once per image, the decoder on every click.
+`scripts/export_sam2_onnx.py <id> --check photo.jpg` builds the pair and compares
+it with the PyTorch predictor (**not yet run end-to-end**, same sandbox limit).
+If the installer is tight on space, ship B+ only; it is close to L for this use.
+
 * `scripts/fetch_models.py` downloads the ready-made ONNX files and prints the
   SHA-256 hashes to pin in the registry.
 * `scripts/export_birefnet_onnx.py` turns the PyTorch-only checkpoints into ONNX
@@ -40,7 +53,7 @@ runs with any subset of these files. Registry: `src/cutout/core/models.py`.
 
 ```
 load_image ──► Segmenter.predict ──► refine_alpha ──► (user edits alpha) ──► compose_rgba ──► save_png
- imageio.py      segmenter.py          refine.py          editing (next)        refine.py        imageio.py
+ imageio.py      segmenter.py          refine.py          editing/              refine.py        imageio.py
  full res        net res (1-2K)        full res           full res               full res
 ```
 
@@ -74,7 +87,12 @@ src/cutout/
     refine.py      upsample, guided filter, foreground estimation, compose
     engine.py      CutoutEngine: the public API the UI and CLI use
   cli.py           command-line front end (dev, benchmarks, installer smoke test)
-  editing/         (next) touch-up tools, pure NumPy on the alpha matte
+    prompt_segmenter.py  PromptSegmenter protocol + OnnxSamSegmenter (click-to-select model)
+  editing/         touch-up tools, pure NumPy/OpenCV on the alpha matte, no Qt
+    matte.py       MatteEditor: brush strokes, merging masks, tile-based undo (Patch, EditHistory)
+    brush.py       Brush settings, soft round stamp, dab spacing
+    select.py      ClickSelector: clicks -> full-res, edge-refined Selection
+    rect.py        Rect: the dirty area every edit returns, for partial repaints
   ui/              (next) PySide6 app
 packaging/         (next) PyInstaller spec, Inno Setup script
 scripts/           build-time model download and export
@@ -106,6 +124,41 @@ save_png(out, rgba, result.image.icc_profile)
   points, added to `models.py` like any other model. Its mask should be refined
   with `refine.guided_refine` before merging, so clicked regions get the same
   edge quality. Never resize the matte.
+* **Editing API (implemented).**
+
+  ```python
+  from cutout.editing import Brush, BrushMode, MaskOp, MatteEditor
+
+  editor = MatteEditor(result.alpha, result.image)   # edits result.alpha in place
+  dirty = editor.begin_stroke(x, y, Brush(BrushMode.ERASE, radius=30, hardness=0.6))
+  dirty = editor.continue_stroke(x, y, pressure)      # Rect to repaint
+  patch = editor.end_stroke()                         # one undo step (or None)
+  editor.undo(); editor.redo()
+
+  selector = engine.click_selector(result)            # ModelNotInstalled if no SAM model
+  selector.prepare()                                  # worker thread, once per image
+  sel = selector.add_click(x, y, positive=True)       # worker thread; sel.preview for an overlay
+  patch = editor.apply_mask(sel, MaskOp.ADD)          # or MaskOp.SUBTRACT
+  ```
+
+  * Coordinates are image pixels in Qt scene convention (pixel `i` spans
+    `[i, i+1)`), so a `QPointF` from the canvas goes straight in.
+  * Brush modes: KEEP (alpha to 1), ERASE (alpha to 0), REFINE (re-fit the edge
+    to the photo with the guided filter, for hair). Within one stroke, dabs
+    combine with `max` into a coverage buffer, so passing twice over the same
+    spot never hardens soft edges and opacity is a true cap.
+  * Undo stores the 256x256 tiles an edit touched, swapped in place on undo and
+    redo. `EditHistory` is capped at 1 GB / 200 steps. A UI with its own
+    `QUndoStack` passes `history=None` and uses `patch.rect`, `patch.before`,
+    `patch.after`.
+  * Brush calls are cheap enough for the UI thread (about 1 ms per mouse move,
+    3 ms for REFINE, at 24 MP on a 4-core CPU). `prepare()` and `add_click()`
+    run models and must go to a worker; `add_click` spent 0.55 s on a selection
+    covering a quarter of a 24 MP photo, mostly the full-res guided filter.
+  * A click mask is rebuilt at full resolution only over its bounding area:
+    the 256x256 logits are sampled at every full-res pixel centre, thresholded,
+    given a narrow soft band and snapped to image edges with `guided_refine`.
+    The previous click's logits are fed back to the decoder, as SAM intends.
 * **UI.** Run every engine call in a worker thread (`QThreadPool`), never on the
   UI thread. Preview by drawing the original image with `alpha` as a mask (a
   checkerboard behind it); call `compose_rgba` only for export, since

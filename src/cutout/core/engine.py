@@ -22,11 +22,22 @@ from typing import Callable
 import numpy as np
 
 from .imageio import LoadedImage, load_image, save_png
-from .models import ModelSpec, Subject, default_models_dir, model_path, resolve_model
+from .models import (
+    ModelSpec,
+    PromptModelSpec,
+    Subject,
+    default_models_dir,
+    model_path,
+    prompt_model_paths,
+    resolve_model,
+    resolve_prompt_model,
+)
+from .prompt_segmenter import OnnxSamSegmenter, PromptSegmenter
 from .refine import RefineOptions, compose_rgba, refine_alpha
 from .segmenter import OnnxSegmenter, Segmenter
 
 SegmenterFactory = Callable[[ModelSpec, Path, str], Segmenter]
+PromptSegmenterFactory = Callable[[PromptModelSpec, Path, Path, str], PromptSegmenter]
 
 
 @dataclass
@@ -52,12 +63,15 @@ class CutoutEngine:
         device: str = "auto",
         refine: RefineOptions = RefineOptions(),
         segmenter_factory: SegmenterFactory | None = None,
+        prompt_segmenter_factory: PromptSegmenterFactory | None = None,
     ):
         self.models_dir = Path(models_dir) if models_dir else default_models_dir()
         self.device = device
         self.refine = refine
         self._factory: SegmenterFactory = segmenter_factory or OnnxSegmenter
         self._segmenters: dict[str, Segmenter] = {}
+        self._prompt_factory: PromptSegmenterFactory = prompt_segmenter_factory or OnnxSamSegmenter
+        self._prompt_segmenters: dict[str, PromptSegmenter] = {}
         self._lock = threading.Lock()
 
     def segmenter_for(self, subject: Subject, model_id: str | None = None) -> Segmenter:
@@ -68,6 +82,24 @@ class CutoutEngine:
                 seg = self._factory(spec, model_path(spec, self.models_dir), self.device)
                 self._segmenters[spec.id] = seg
         return seg
+
+    def prompt_segmenter(self, model_id: str | None = None) -> PromptSegmenter:
+        """The click-to-select model (best installed SAM 2.1). Raises ModelNotInstalled if none."""
+        spec = resolve_prompt_model(self.models_dir, model_id)
+        with self._lock:
+            seg = self._prompt_segmenters.get(spec.id)
+            if seg is None:
+                enc, dec = prompt_model_paths(spec, self.models_dir)
+                seg = self._prompt_factory(spec, enc, dec, self.device)
+                self._prompt_segmenters[spec.id] = seg
+        return seg
+
+    def click_selector(self, image: "CutoutResult | LoadedImage", model_id: str | None = None, opts=None):
+        """A ``ClickSelector`` for this image. Call its ``prepare()`` in a worker right away."""
+        from ..editing.select import ClickSelector, SelectOptions  # editing depends on core, not vice versa
+
+        img = image.image if isinstance(image, CutoutResult) else image
+        return ClickSelector(self.prompt_segmenter(model_id), img, opts or SelectOptions(refine=self.refine))
 
     def warmup(self, subject: Subject = Subject.PERSON) -> None:
         seg = self.segmenter_for(subject)
