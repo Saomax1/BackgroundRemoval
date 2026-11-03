@@ -11,7 +11,7 @@ input resolution. This document is the map for everyone building on the engine.
 | Language | Python 3.12 | Best ecosystem for image models; PyInstaller freezes it into a normal Windows app. |
 | Inference | ONNX Runtime GPU, CUDA execution provider | Runs exported models without shipping PyTorch (~2.5 GB saved). CUDA 12 + cuDNN come as pip wheels (`onnxruntime-gpu[cuda,cudnn]`) and are loaded by `onnxruntime.preload_dlls()`, so the user installs nothing but the app. Falls back to CPU if CUDA fails. |
 | Image ops | NumPy + OpenCV (headless) + Pillow | OpenCV for fast filters and 16-bit PNG/TIFF, Pillow for EXIF, ICC and palette formats. Headless OpenCV avoids clashing with Qt. |
-| UI (next) | PySide6 (Qt 6) | Native-feeling Windows UI, a fast `QGraphicsView` canvas for brushing at full resolution, Qt threads for keeping the UI responsive. |
+| UI | PySide6 (Qt 6) | Native-feeling Windows UI, a fast `QGraphicsView` canvas for brushing at full resolution, Qt threads for keeping the UI responsive. |
 | Installer | PyInstaller one-folder build + Inno Setup 6.5.2+ | One `Setup.exe` (Inno's single-file limit is about 4 GB), desktop and Start-menu shortcuts, uninstaller. Models are copied into `{app}\models`. Built and smoke-tested in GitHub Actions; see `packaging/README.md`. |
 
 ## Models
@@ -86,14 +86,14 @@ src/cutout/
     segmenter.py   Segmenter protocol + OnnxSegmenter (pre/post-processing)
     refine.py      upsample, guided filter, foreground estimation, compose
     engine.py      CutoutEngine: the public API the UI and CLI use
-  cli.py           command-line front end (dev, benchmarks, installer smoke test)
     prompt_segmenter.py  PromptSegmenter protocol + OnnxSamSegmenter (click-to-select model)
+  cli.py           command-line front end (dev, benchmarks, installer smoke test)
   editing/         touch-up tools, pure NumPy/OpenCV on the alpha matte, no Qt
     matte.py       MatteEditor: brush strokes, merging masks, tile-based undo (Patch, EditHistory)
     brush.py       Brush settings, soft round stamp, dab spacing
     select.py      ClickSelector: clicks -> full-res, edge-refined Selection
     rect.py        Rect: the dirty area every edit returns, for partial repaints
-  ui/              (next) PySide6 app
+  ui/              PySide6 editor window (see "Editor window" below)
 packaging/         PyInstaller spec, Inno Setup script, model staging (packaging/README.md)
 scripts/           build-time model download, export and checks
 ```
@@ -172,13 +172,61 @@ save_png(out, rgba, result.image.icc_profile)
   `--list-models` and one run per subject on a generated sample. New models only
   need a registry entry: `scripts/build_models.py` builds and checks every entry.
 
+## Editor window
+
+`python -m cutout.ui [image]` (or `cutout-gui`, or `from cutout.ui import main`
+in the packaged `Cutout.exe`). Files in `src/cutout/ui`:
+
+| File | Role |
+|---|---|
+| `app.py` | `main(argv)`, dark Fusion theme, Windows taskbar id. |
+| `main_window.py` | Open / drag-drop, Person/Anime switch, auto removal on open, Save PNG, menus, status bar (size, model, GPU/CPU, timing, pixel opacity, zoom). |
+| `document.py` | `CutoutDocument`: image, `alpha`, `QUndoStack`. All matte edits go through it. |
+| `canvas.py` | `CutoutCanvas`: `QGraphicsView` with screen-space checkerboard (or white/black), wheel zoom at cursor, drag/Space/middle-button pan, "show original" compare. |
+| `tools.py` | `CanvasTool` base + `ToolContext`: the hook the touch-up tools plug into. |
+| `workers.py` | `Task` on `QThreadPool`; results come back as signals on the UI thread. |
+
+Behaviour worth knowing:
+
+* Opening an image starts the automatic removal right away. Switching the
+  subject or "Redo Auto" re-runs it as one undoable step.
+* The preview is an 8-bit premultiplied copy of the image with the matte as
+  alpha. Only changed rectangles are recomputed, so brush strokes stay live on
+  large photos. Edge colour cleanup runs only on export.
+* Save composes at full resolution and bit depth on a worker thread, writes
+  `<name>_cutout.png` by default, and refuses to overwrite the source image.
+* While a task runs a busy overlay covers the canvas and conflicting actions
+  are disabled, so the matte cannot change under a running save.
+
+### Adding a touch-up tool
+
+```python
+class BrushTool(CanvasTool):
+    id, label = "brush", "Brush"
+    def mouse_press(self, pos, event):      # pos: QPointF in image pixels
+        ...edit self.ctx.document.alpha in place...
+        self.ctx.document.notify_alpha_changed(dirty_qrect)   # live redraw
+        return True
+    def mouse_release(self, pos, event):
+        self.ctx.document.push_patch(rect, after, before=before, text="Brush")  # one undo step
+        return True
+
+window.register_tool(BrushTool(), shortcut="B")
+```
+
+Long work (a click-to-select model) goes through
+`ctx.run_in_background(fn, *args, on_done=..., on_error=...)`. Tools that set
+`needs_alpha = True` (the default) are disabled until a cutout exists. Ctrl or
+Alt + wheel is offered to the tool first (for brush size); plain wheel zooms.
+
 ## Development
 
 ```
 python -m venv .venv && .venv\Scripts\activate
-pip install -e ".[gpu,dev]"          # or ".[cpu,dev]" without an NVIDIA GPU
+pip install -e ".[gpu,ui,dev]"       # or ".[cpu,ui,dev]" without an NVIDIA GPU
 python scripts/fetch_models.py
 python -m cutout photo.jpg --subject person
+python -m cutout.ui                   # the editor window
 pytest
 ```
 

@@ -59,7 +59,7 @@ This keeps Cutout's pieces separate from anything else on your PC.
 ```powershell
 py -3.12 -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -e ".[gpu]"
+pip install -e ".[gpu,ui]"
 ```
 
 After the second line your prompt starts with `(.venv)`. **Whenever you open a
@@ -114,7 +114,20 @@ python -m cutout --list-models
 
 Each model you set up shows `[installed]`.
 
-## Removing a background
+## Using the editor window
+
+```powershell
+python -m cutout.ui
+```
+
+Drop a picture onto the window (or click **Open image…**). The background is
+removed automatically. Pick **Person** or **Anime** at the top to match the
+picture; switching re-runs the removal. Scroll to zoom, drag to move around,
+and press **O** to compare with the original. **Save PNG** writes a
+transparent PNG at the exact size of your picture, next to it as
+`name_cutout.png` by default.
+
+## Removing a background from the command line
 
 ```powershell
 python -m cutout "C:\Pictures\me.jpg"
@@ -140,7 +153,7 @@ Cutout couldn't use your graphics card. It still works, just slower. To fix it:
 3. Make sure only the GPU version of the AI runtime is installed:
    ```powershell
    pip uninstall -y onnxruntime onnxruntime-gpu
-   pip install -e ".[gpu]"
+   pip install -e ".[gpu,ui]"
    ```
 4. To see the exact reason, force the graphics card and read the error:
    `python -m cutout "C:\Pictures\me.jpg" --device cuda`
@@ -177,5 +190,5 @@ thrown away and started fresh.
 ## For developers
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how the engine is put together.
-Install with `pip install -e ".[gpu,dev]"` (or `".[cpu,dev]"` without an NVIDIA
+Install with `pip install -e ".[gpu,ui,dev]"` (or `".[cpu,ui,dev]"` without an NVIDIA
 card) and run the tests with `pytest`. The tests need no models or GPU.
