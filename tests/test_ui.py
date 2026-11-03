@@ -158,7 +158,7 @@ class StampTool(CanvasTool):
 
 def test_tool_hook_receives_image_coordinates_and_undo_works(window, tmp_path):
     tool = StampTool()
-    act = window.register_tool(tool, shortcut="S")
+    act = window.register_tool(tool)
     _open(window, _photo(tmp_path))
     assert act.isEnabled()
     window.activate_tool("stamp")

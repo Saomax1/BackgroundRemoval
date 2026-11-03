@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QCursor, QIcon, QKeyEvent, QMouseEvent
+from PySide6.QtWidgets import QWidget
 
 if TYPE_CHECKING:  # pragma: no cover
     from .canvas import CutoutCanvas
@@ -37,6 +38,10 @@ class ToolContext:
     run_in_background: Callable[..., None]
     # Show a short message in the status bar.
     show_message: Callable[[str], None]
+    # Show an error to the user: report_error(title, exception).
+    report_error: Callable[[str, BaseException], None] = lambda title, exc: None
+    # Cover the canvas with the busy overlay: set_busy("Working…") ... set_busy(None).
+    set_busy: Callable[[str | None], None] = lambda text: None
 
 
 class CanvasTool:
@@ -85,6 +90,16 @@ class CanvasTool:
 
     def view_changed(self) -> None:
         """The zoom or scroll changed: update any on-screen overlay such as a brush outline."""
+
+    def hover_leave(self) -> None:
+        """The pointer left the canvas: hide hover-only overlays."""
+
+    def options_widget(self) -> QWidget | None:
+        """Settings shown in the options bar under the toolbar while this tool is active.
+
+        Return the same widget on every call. Tools may share one widget (all brushes do).
+        """
+        return None
 
 
 class PanTool(CanvasTool):

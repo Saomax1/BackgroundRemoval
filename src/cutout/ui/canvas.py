@@ -174,7 +174,9 @@ class CutoutCanvas(QGraphicsView):
 
     # ------------------------------------------------------- document hooks
     def _on_image_changed(self) -> None:
-        self._scene.clear()
+        # Remove only the preview: tools keep their own overlay items in the scene.
+        if self._item is not None:
+            self._scene.removeItem(self._item)
         self._item = None
         self._rgb8 = None
         img = self.doc.image
@@ -330,6 +332,8 @@ class CutoutCanvas(QGraphicsView):
 
     def leaveEvent(self, event) -> None:
         self.hover_pixel.emit(-1, -1)
+        if self._tool is not None:
+            self._tool.hover_leave()
         super().leaveEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
