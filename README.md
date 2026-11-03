@@ -6,9 +6,11 @@ your NVIDIA graphics card to go fast, and never shrinks your picture: what comes
 out is exactly the same size as what went in.
 
 **Where things stand:** the background-removal engine works from a command
-window today. The point-and-click app, the touch-up brush and the one-click
-`Setup.exe` installer are being built next. Until the installer exists, use the
-steps below. You only do them once.
+window today. The point-and-click app and the touch-up brush are being built
+next. A one-click `Setup.exe` that installs everything (models included) is
+built automatically on GitHub; see [packaging/README.md](packaging/README.md)
+for where to download it. Until you have that, use the steps below. You only
+do them once.
 
 ---
 

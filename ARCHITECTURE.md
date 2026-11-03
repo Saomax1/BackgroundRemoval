@@ -12,7 +12,7 @@ input resolution. This document is the map for everyone building on the engine.
 | Inference | ONNX Runtime GPU, CUDA execution provider | Runs exported models without shipping PyTorch (~2.5 GB saved). CUDA 12 + cuDNN come as pip wheels (`onnxruntime-gpu[cuda,cudnn]`) and are loaded by `onnxruntime.preload_dlls()`, so the user installs nothing but the app. Falls back to CPU if CUDA fails. |
 | Image ops | NumPy + OpenCV (headless) + Pillow | OpenCV for fast filters and 16-bit PNG/TIFF, Pillow for EXIF, ICC and palette formats. Headless OpenCV avoids clashing with Qt. |
 | UI (next) | PySide6 (Qt 6) | Native-feeling Windows UI, a fast `QGraphicsView` canvas for brushing at full resolution, Qt threads for keeping the UI responsive. |
-| Installer (next) | PyInstaller one-folder build + Inno Setup | One `Setup.exe`, Start-menu shortcut, uninstaller. Models are copied into `{app}\models`. Expected size about 2.5 to 3.5 GB, within the 5 GB budget. |
+| Installer | PyInstaller one-folder build + Inno Setup 6.5.2+ | One `Setup.exe` (Inno's single-file limit is about 4 GB), desktop and Start-menu shortcuts, uninstaller. Models are copied into `{app}\models`. Built and smoke-tested in GitHub Actions; see `packaging/README.md`. |
 
 ## Models
 
@@ -94,8 +94,8 @@ src/cutout/
     select.py      ClickSelector: clicks -> full-res, edge-refined Selection
     rect.py        Rect: the dirty area every edit returns, for partial repaints
   ui/              (next) PySide6 app
-packaging/         (next) PyInstaller spec, Inno Setup script
-scripts/           build-time model download and export
+packaging/         PyInstaller spec, Inno Setup script, model staging (packaging/README.md)
+scripts/           build-time model download, export and checks
 ```
 
 ### Public engine API
@@ -164,9 +164,13 @@ save_png(out, rgba, result.image.icc_profile)
   checkerboard behind it); call `compose_rgba` only for export, since
   decontamination on a large photo takes about a second. Show
   `result.device` so a CPU fallback is visible.
-* **Installer.** Freeze with PyInstaller (one-folder), include the `nvidia/*`
-  DLL folders from site-packages, put models in `{app}\models`. The smoke test
-  after install is `cutout.exe --list-models` plus one run on a bundled sample.
+* **Installer.** Freeze with PyInstaller (one-folder): `Cutout.exe` (window,
+  calls `cutout.ui.main(argv)`) and `cutout-cli.exe` (console). Every DLL from
+  the `nvidia-*` wheels is copied flat into `_internal\nvidia_dlls`, which
+  `runtime.py` adds to the DLL search path before ORT loads CUDA. Models go in
+  `{app}\models`. The smoke test after install is `cutout-cli.exe --diagnose`,
+  `--list-models` and one run per subject on a generated sample. New models only
+  need a registry entry: `scripts/build_models.py` builds and checks every entry.
 
 ## Development
 
