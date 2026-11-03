@@ -15,7 +15,14 @@ from dataclasses import replace
 from pathlib import Path
 
 from .core.engine import CutoutEngine
-from .core.models import REGISTRY, Subject, default_models_dir, installed_models
+from .core.models import (
+    PROMPT_REGISTRY,
+    REGISTRY,
+    Subject,
+    default_models_dir,
+    installed_models,
+    installed_prompt_models,
+)
 from .core.refine import RefineOptions
 
 
@@ -45,6 +52,10 @@ def main(argv: list[str] | None = None) -> int:
         for spec in REGISTRY.values():
             mark = "installed" if spec.id in have else "missing  "
             print(f"  [{mark}] {spec.id:22s} {spec.subject.value:7s} {spec.description}")
+        have_prompt = {s.id for s in installed_prompt_models(models_dir)}
+        for pspec in PROMPT_REGISTRY.values():
+            mark = "installed" if pspec.id in have_prompt else "missing  "
+            print(f"  [{mark}] {pspec.id:22s} {'click':7s} {pspec.description}")
         return 0
 
     if args.input is None:

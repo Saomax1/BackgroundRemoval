@@ -155,3 +155,91 @@ def resolve_model(subject: Subject, models_dir: Path, model_id: str | None = Non
         f"no {subject.value} model installed in {models_dir}; "
         f"expected one of {[REGISTRY[c].filename for c in DEFAULT_MODELS[subject]]}"
     )
+
+
+# --- Click-to-select (promptable) models ---------------------------------------------
+#
+# These take click points instead of segmenting the whole image. They ship as two ONNX
+# files: a heavy image encoder that runs once per image (on load, in the background) and a
+# tiny prompt decoder that runs on every click (a few ms on GPU). Both are produced by
+# ``scripts/export_sam2_onnx.py`` with fixed input/output names (see prompt_segmenter.py).
+
+
+@dataclass(frozen=True)
+class PromptModelSpec:
+    id: str
+    encoder_filename: str
+    decoder_filename: str
+    input_size: int = 1024  # SAM 2 stretches the image to a 1024 square
+    mean: tuple[float, float, float] = IMAGENET_MEAN
+    std: tuple[float, float, float] = IMAGENET_STD
+    low_res_size: int = 256  # side of the mask logits the decoder returns
+    export_source: str | None = None
+    encoder_sha256: str | None = None
+    decoder_sha256: str | None = None
+    approx_size_mb: int = 0
+    description: str = ""
+
+
+PROMPT_REGISTRY: dict[str, PromptModelSpec] = {
+    spec.id: spec
+    for spec in (
+        PromptModelSpec(
+            id="sam2.1-hiera-large",
+            encoder_filename="sam2.1-hiera-large.encoder.onnx",
+            decoder_filename="sam2.1-hiera-large.decoder.onnx",
+            export_source="hf:facebook/sam2.1-hiera-large",
+            approx_size_mb=900,
+            description="SAM 2.1 Hiera-L. Most accurate click-to-select.",
+        ),
+        PromptModelSpec(
+            id="sam2.1-hiera-base-plus",
+            encoder_filename="sam2.1-hiera-base-plus.encoder.onnx",
+            decoder_filename="sam2.1-hiera-base-plus.decoder.onnx",
+            export_source="hf:facebook/sam2.1-hiera-base-plus",
+            approx_size_mb=330,
+            description="SAM 2.1 Hiera-B+. Nearly as good, a third of the size.",
+        ),
+        PromptModelSpec(
+            id="sam2.1-hiera-small",
+            encoder_filename="sam2.1-hiera-small.encoder.onnx",
+            decoder_filename="sam2.1-hiera-small.decoder.onnx",
+            export_source="hf:facebook/sam2.1-hiera-small",
+            approx_size_mb=190,
+            description="SAM 2.1 Hiera-S. Small fallback.",
+        ),
+    )
+}
+
+DEFAULT_PROMPT_MODELS: tuple[str, ...] = ("sam2.1-hiera-large", "sam2.1-hiera-base-plus", "sam2.1-hiera-small")
+
+
+def prompt_model_paths(spec: PromptModelSpec, models_dir: Path) -> tuple[Path, Path]:
+    return Path(models_dir) / spec.encoder_filename, Path(models_dir) / spec.decoder_filename
+
+
+def _prompt_installed(spec: PromptModelSpec, models_dir: Path) -> bool:
+    return all(p.is_file() for p in prompt_model_paths(spec, models_dir))
+
+
+def installed_prompt_models(models_dir: Path) -> list[PromptModelSpec]:
+    return [s for s in PROMPT_REGISTRY.values() if _prompt_installed(s, models_dir)]
+
+
+def resolve_prompt_model(models_dir: Path, model_id: str | None = None) -> PromptModelSpec:
+    """The click-to-select model to use: an explicit id, or the best one installed."""
+    if model_id is not None:
+        if model_id not in PROMPT_REGISTRY:
+            raise KeyError(f"unknown prompt model {model_id!r}; known: {sorted(PROMPT_REGISTRY)}")
+        spec = PROMPT_REGISTRY[model_id]
+        if not _prompt_installed(spec, models_dir):
+            raise ModelNotInstalled(f"prompt model {model_id!r} not found in {models_dir}")
+        return spec
+    for candidate in DEFAULT_PROMPT_MODELS:
+        spec = PROMPT_REGISTRY[candidate]
+        if _prompt_installed(spec, models_dir):
+            return spec
+    raise ModelNotInstalled(
+        f"no click-to-select model installed in {models_dir}; expected the encoder and decoder of one of "
+        f"{list(DEFAULT_PROMPT_MODELS)}"
+    )
