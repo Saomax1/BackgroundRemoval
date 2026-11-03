@@ -20,10 +20,15 @@ dependencies = [
 gpu = ["onnxruntime-gpu[cuda,cudnn]>=1.21"]
 # CPU-only fallback, used by CI and for development machines without NVIDIA.
 cpu = ["onnxruntime>=1.21"]
+# Desktop editor window (src/cutout/ui).
+ui = ["PySide6>=6.7"]
 dev = ["pytest>=8", "onnx>=1.16"]
 
 [project.scripts]
 cutout = "cutout.cli:main"
+
+[project.gui-scripts]
+cutout-gui = "cutout.ui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

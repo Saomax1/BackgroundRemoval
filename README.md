@@ -11,9 +11,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Quick start (development)
 
 ```
-pip install -e ".[gpu,dev]"
+pip install -e ".[gpu,ui,dev]"
 python scripts/fetch_models.py
 python -m cutout photo.jpg                 # writes photo_cutout.png
 python -m cutout art.png --subject anime
 python -m cutout --list-models
+python -m cutout.ui                        # editor window: open or drop an image
 ```
