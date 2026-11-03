@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: key
-        run: echo "key=models-${{ env.MODELS_CACHE_SALT }}-${{ hashFiles('src/cutout/core/models.py', 'scripts/export_birefnet_onnx.py', 'scripts/build_models.py', 'scripts/fetch_models.py', 'packaging/requirements-export.txt') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=models-${{ env.MODELS_CACHE_SALT }}-${{ hashFiles('src/cutout/core/models.py', 'scripts/export_birefnet_onnx.py', 'scripts/onnx_deform_conv.py', 'scripts/build_models.py', 'scripts/fetch_models.py', 'packaging/requirements-export.txt') }}" >> "$GITHUB_OUTPUT"
       - id: cache
         uses: actions/cache/restore@v4
         with:
@@ -63,6 +63,9 @@ jobs:
       - name: Install export toolchain
         if: steps.cache.outputs.cache-hit != 'true'
         run: pip install -e ".[cpu]" -r packaging/requirements-export.txt
+      - name: Check the ONNX deformable-conv replacement against torchvision
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python scripts/onnx_deform_conv.py
       - name: Build and check models
         if: steps.cache.outputs.cache-hit != 'true'
         run: python scripts/build_models.py --models-dir build/models
