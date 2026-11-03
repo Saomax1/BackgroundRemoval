@@ -162,7 +162,7 @@ Install the Microsoft Visual C++ Redistributable (x64) from
 The top people model needs a fair amount of graphics memory. Use the smaller one:
 `python -m cutout photo.jpg --model birefnet-general`
 
-**"No model installed" / "expected one of ..."**
+**"no person model installed" (or "no anime model installed")**
 The models aren't in the `models` folder yet. Re-run step 4, and check with
 `python -m cutout --list-models`.
 
