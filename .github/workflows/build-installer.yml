@@ -1,0 +1,166 @@
+name: windows installer
+
+# Builds Cutout-Setup-<version>.exe: PyInstaller app + CUDA/cuDNN DLLs + AI models,
+# wrapped by Inno Setup, then installs it silently on a clean runner and runs it.
+# Download the result from the run's "Artifacts" section.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "scripts/**"
+      - "src/cutout/core/models.py"
+      - "src/cutout/core/runtime.py"
+      - "pyproject.toml"
+      - ".github/workflows/build-installer.yml"
+
+concurrency:
+  group: installer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Bump to force a model rebuild without changing any model file.
+  MODELS_CACHE_SALT: "v1"
+
+jobs:
+  models:
+    # Downloads ready-made ONNX files and exports the PyTorch-only ones. Slow (exports
+    # run on CPU), so the result is cached and only rebuilt when the recipe changes.
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: key
+        run: echo "key=models-${{ env.MODELS_CACHE_SALT }}-${{ hashFiles('src/cutout/core/models.py', 'scripts/export_birefnet_onnx.py', 'scripts/build_models.py', 'scripts/fetch_models.py', 'packaging/requirements-export.txt') }}" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/models
+          key: ${{ steps.key.outputs.key }}
+          enableCrossOsArchive: true
+          lookup-only: true
+      - name: Free disk space
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: Add swap for the 2048 px export
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-export && sudo chmod 600 /swapfile-export
+          sudo mkswap /swapfile-export && sudo swapon /swapfile-export && free -h
+      - uses: actions/setup-python@v5
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install export toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: pip install -e ".[cpu]" -r packaging/requirements-export.txt
+      - name: Build and check models
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python scripts/build_models.py --models-dir build/models
+      - name: Show manifest
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        run: cat build/models/manifest.json || true
+      - uses: actions/cache/save@v4
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: build/models
+          key: ${{ steps.key.outputs.key }}
+          enableCrossOsArchive: true
+
+  installer:
+    needs: models
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install app with GPU runtime and build tools
+        run: |
+          python -m pip install --upgrade pip
+          # The ui extra arrives with the editor window; pip only warns while it is missing.
+          pip install -e ".[gpu,ui,build,dev]"
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Freeze with PyInstaller
+        run: pyinstaller packaging/cutout.spec --noconfirm --distpath dist --workpath build/pyinstaller
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: build/models
+          key: ${{ needs.models.outputs.key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+      - name: Stage models
+        run: python packaging/stage_models.py build/models dist/Cutout/models
+
+      - name: Report app size
+        run: |
+          $mb = (Get-ChildItem dist/Cutout -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
+          "dist/Cutout: {0:N0} MB" -f $mb
+
+      - name: Install Inno Setup
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $v = [version](Get-Item $iscc).VersionInfo.ProductVersion.Split(' ')[0]
+          "Inno Setup $v"
+          if ($v -lt [version]"6.5.2") { choco upgrade innosetup -y --no-progress }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build Setup.exe
+        run: |
+          $version = python -c "import cutout; print(cutout.__version__)"
+          & $env:ISCC /Qp "/DAppVersion=$version" packaging\cutout.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $setup = Get-ChildItem dist/installer/*.exe | Select-Object -First 1
+          "{0}: {1:N2} GB" -f $setup.Name, ($setup.Length / 1GB)
+          if ($setup.Length -gt 4.2e9) { throw "Setup.exe is over the ~4 GB single-file limit" }
+          "SETUP=$($setup.FullName)" >> $env:GITHUB_ENV
+
+      - name: Smoke test the installed app
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "CutoutInstall"
+          $p = Start-Process $env:SETUP -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER","/DIR=`"$dir`"","/LOG=`"$env:RUNNER_TEMP\setup.log`"" -Wait -PassThru
+          if ($p.ExitCode) { Get-Content "$env:RUNNER_TEMP\setup.log" -Tail 40; throw "setup exited $($p.ExitCode)" }
+          foreach ($f in "Cutout.exe", "cutout-cli.exe", "models") {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "missing $f after install" }
+          }
+          $cli = Join-Path $dir "cutout-cli.exe"
+
+          $diag = & $cli --diagnose | Out-String
+          $diag
+          # No GPU on the runner, but every CUDA/cuDNN DLL must still resolve from the bundle.
+          if ($diag -notmatch "CUDA provider DLL loads: yes") { throw "CUDA DLLs are not loadable from the install" }
+
+          & $cli --list-models
+          if ($LASTEXITCODE) { throw "--list-models failed" }
+
+          python -c "import numpy as np; from PIL import Image; y,x=np.mgrid[0:601,0:433]; a=np.stack([x%255,y%255,(x*y)%255],-1).astype('uint8'); a[150:450,120:310]=(220,170,140); Image.fromarray(a).save(r'$env:RUNNER_TEMP\sample.png')"
+          foreach ($subject in "person", "anime") {
+            $out = Join-Path $env:RUNNER_TEMP "out_$subject.png"
+            & $cli "$env:RUNNER_TEMP\sample.png" --subject $subject --device cpu -o $out
+            if ($LASTEXITCODE) { throw "$subject cutout failed" }
+            python -c "from PIL import Image; im=Image.open(r'$out'); assert im.mode=='RGBA' and im.size==(433,601), (im.mode, im.size); print('ok', im.size)"
+            if ($LASTEXITCODE) { throw "$subject output is wrong" }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cutout-Setup
+          path: dist/installer/*.exe
+          compression-level: 0
+          retention-days: 30
