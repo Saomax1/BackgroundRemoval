@@ -268,6 +268,9 @@ class MainWindow(QMainWindow):
         # The whole cutout from before the last Head only, so Head only can be switched off
         # (or the head re-marked) without running the model again. None when no head cut is shown.
         self._full_alpha: np.ndarray | None = None
+        # The face the user boxed with Mark Face on this image: re-runs (Redo Auto, a subject
+        # switch) keep that head instead of searching again.
+        self._marked_faces: list[Face] | None = None
 
         self.warmup_tracker = WarmupTracker(self.settings, parent=self)
 
@@ -694,6 +697,7 @@ class MainWindow(QMainWindow):
         gen = self._generation
         subject = self.subject
         head = self.head_only
+        marked = self._marked_faces
         engine = self.engine
 
         def work():
@@ -701,6 +705,11 @@ class MainWindow(QMainWindow):
             if not head:
                 return result, None
             try:
+                if marked:
+                    try:
+                        return result, engine.head_only(image, result.alpha, subject, marked)
+                    except NoFaceFound:  # the box is off this cutout: look for faces instead
+                        pass
                 return result, engine.head_only(image, result.alpha, subject)
             except NoFaceFound:
                 return result, None
@@ -772,9 +781,11 @@ class MainWindow(QMainWindow):
         """Keep only the head of the face the user boxed (the Mark Face tool)."""
         if not self.doc.has_alpha or self.is_busy:
             return
-        self._cut_head([Face.from_box(x0, y0, x1, y1)], source=self._full_alpha)
+        faces = [Face.from_box(x0, y0, x1, y1)]
+        self._cut_head(faces, source=self._full_alpha, remember=True)
 
-    def _cut_head(self, faces: list[Face] | None = None, source: np.ndarray | None = None) -> None:
+    def _cut_head(self, faces: list[Face] | None = None, source: np.ndarray | None = None,
+                  remember: bool = False) -> None:
         image = self.doc.image
         source = self.doc.snapshot_alpha() if source is None else source
         subject = self.subject
@@ -785,6 +796,8 @@ class MainWindow(QMainWindow):
             if image is not self.doc.image or not self.doc.has_alpha:
                 return
             self._full_alpha = source
+            if remember:
+                self._marked_faces = list(cut.faces)
             self.doc.replace_alpha(cut.alpha, "Head only")
             self._show_head_checked(True)
             self._prepare_save_in_background()
@@ -964,6 +977,7 @@ class MainWindow(QMainWindow):
         img = self.doc.image
         self._save_prep = None  # the old image's prepared PNG is no use any more
         self._full_alpha = None
+        self._marked_faces = None
         self._show_head_checked(bool(self.settings.value("head_only", False, type=bool)))
         self.act_original.setChecked(False)
         self.canvas.set_show_original(False)

@@ -195,10 +195,19 @@ class FaceFinder:
                 faces = [f for f in faces if _on_matte(f, alpha)]
             if faces:
                 biggest = max(f.w * f.h for f in faces)
-                return [f for f in faces if f.w * f.h >= (o.min_relative_size ** 2) * biggest]
+                kept = [f for f in faces if f.w * f.h >= (o.min_relative_size ** 2) * biggest]
+                log.info("head only: %d face(s) at confidence %.2f: %s", len(kept), threshold, describe(kept))
+                return kept
+            log.info("head only: no face on the cutout at confidence %.2f", threshold)
             if threshold <= o.retry_threshold:
                 break
         return []
+
+
+def describe(faces: list[Face]) -> str:
+    """Short text for the log and debug report: box, confidence and tilt of each face."""
+    return "; ".join(f"{f.w:.0f}x{f.h:.0f} at {f.x:.0f},{f.y:.0f} score {f.score:.2f} tilt "
+                     f"{math.degrees(f.roll):.0f}°" for f in faces) or "none"
 
 
 def _step(alpha: np.ndarray) -> int:

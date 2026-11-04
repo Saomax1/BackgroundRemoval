@@ -456,3 +456,18 @@ def test_mark_face_tool_drag_draws_box_and_cuts(window, tmp_path, monkeypatch):
     assert tool._item is None
     wait_until(lambda: not window.is_busy)
     assert window.doc.alpha[420, 201] == 0.0 and window.doc.alpha[250, 201] == 1.0
+
+
+def test_marked_face_is_kept_when_the_subject_switch_reruns(window, tmp_path, monkeypatch):
+    # The finder would pick a different (wrong) face; the user's box must win on a re-run.
+    _fake_faces(window, monkeypatch, [(160.0, 330.0, 80.0, 90.0)])
+    _open(window, _photo(tmp_path))
+    window.mark_face(160.0, 200.0, 240.0, 290.0)
+    wait_until(lambda: not window.is_busy)
+    assert window.doc.alpha[420, 201] == 0.0
+    window.set_subject(Subject.ANIME)  # re-runs the cutout with Head only on
+    wait_until(lambda: not window.is_busy and window.doc.undo_stack.undoText() == "Automatic removal")
+    assert window.doc.alpha[420, 201] == 0.0 and window.doc.alpha[250, 201] == 1.0
+    # A new image forgets the box.
+    _open(window, _photo(tmp_path, name="other.png"))
+    assert window._marked_faces is None
