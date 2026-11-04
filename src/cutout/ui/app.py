@@ -66,6 +66,8 @@ QComboBox QAbstractItemView {{
 
 QLabel#emptyTitle {{ color: #e8eaed; font-size: 22pt; font-weight: 600; }}
 QLabel#emptySub {{ color: #bdc1c6; font-size: 11pt; }}
+QWidget#confirmBar {{ background: rgba(44, 46, 51, 240); border: 1px solid #4a4c52; border-radius: 12px; }}
+QLabel#confirmText {{ color: #e8eaed; font-size: 10.5pt; }}
 QLabel#emptyHint {{ color: #80868b; }}
 QLabel#warmupLabel {{ color: #bdc1c6; }}
 QProgressBar#warmupBar {{ background: #36373c; border: none; border-radius: 3px; }}
