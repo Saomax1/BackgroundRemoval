@@ -37,6 +37,15 @@ class Task(QRunnable):
             value = self.fn(*self.args, **self.kwargs)
         except BaseException as exc:  # noqa: BLE001 - report every failure to the UI
             log.error("background task failed:\n%s", traceback.format_exc())
-            self.signals.failed.emit(exc)
+            self._emit(self.signals.failed, exc)
         else:
-            self.signals.finished.emit(value)
+            self._emit(self.signals.finished, value)
+
+    @staticmethod
+    def _emit(signal, value) -> None:
+        # If the window closed while this ran (e.g. a model warm-up at exit), Qt has already
+        # deleted the signals object; there is nobody left to tell, so don't crash the thread.
+        try:
+            signal.emit(value)
+        except RuntimeError as exc:
+            log.debug("result of a background task dropped, its window is gone: %s", exc)

@@ -84,7 +84,7 @@ def photo(tmp_path, image):
 def test_switching_subject_unloads_previous_model(tmp_path, photo):
     _install(tmp_path, "birefnet-hr-matting", "toonout")
     gpu = FakeGpu(capacity=1)
-    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=gpu.factory)
+    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=gpu.factory, max_resident=1)
 
     person = engine.remove_background(photo, Subject.PERSON)
     assert person.model_id == "birefnet-hr-matting" and person.notice is None
@@ -187,3 +187,111 @@ def test_release_models(tmp_path, photo):
     engine.remove_background(photo, Subject.ANIME)
     engine.release_models()
     assert engine.loaded_models == [] and gpu.resident() == 0
+
+
+# --- keeping models loaded and warm (first run of a fresh session is slow) -------------------
+
+import threading
+import time
+
+
+class _SlowFirstRun:
+    """Records every predict; the first one per instance is 'slow' and must run alone."""
+
+    active = 0
+    overlap = False
+    created: list = []
+
+    def __init__(self, spec, path, device):
+        self.name, self.runs, self.warmed = spec.id, 0, 0
+        _SlowFirstRun.created.append(spec.id)
+
+    def predict(self, rgb):
+        _SlowFirstRun.active += 1
+        _SlowFirstRun.overlap |= _SlowFirstRun.active > 1
+        time.sleep(0.2 if self.runs == 0 else 0.01)
+        self.runs += 1
+        _SlowFirstRun.active -= 1
+        return disc_alpha(64, 64)
+
+    def warmup(self):
+        self.warmed += 1
+        self.predict(np.zeros((8, 8, 3), np.uint8))
+
+
+@pytest.fixture
+def slow():
+    _SlowFirstRun.active, _SlowFirstRun.overlap, _SlowFirstRun.created = 0, False, []
+    return _SlowFirstRun
+
+
+def test_both_models_stay_loaded_when_they_fit(tmp_path, photo, slow):
+    _install(tmp_path, "birefnet-hr-matting", "toonout")
+    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=slow, max_resident=2)
+    for subject in (Subject.PERSON, Subject.ANIME, Subject.PERSON, Subject.ANIME):
+        engine.remove_background(photo, subject)
+    assert slow.created == ["birefnet-hr-matting", "toonout"]  # no reload on switching back
+    assert sorted(engine.loaded_models) == ["birefnet-hr-matting", "toonout"]
+
+
+def test_least_recently_used_model_is_unloaded(tmp_path, photo, slow):
+    _install(tmp_path, "birefnet-hr-matting", "toonout", "birefnet-general")
+    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=slow, max_resident=2)
+    engine.remove_background(photo, Subject.PERSON)
+    engine.remove_background(photo, Subject.ANIME)
+    engine.remove_background(photo, Subject.PERSON)  # person is now the most recent
+    engine.remove_background(photo, Subject.PERSON, model_id="birefnet-general")
+    assert sorted(engine.loaded_models) == ["birefnet-general", "birefnet-hr-matting"]
+
+
+def test_warmup_all_warms_both_once_and_first_cutout_is_warm(tmp_path, photo, slow):
+    _install(tmp_path, "birefnet-hr-matting", "toonout")
+    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=slow, max_resident=2)
+    engine.warmup_all(Subject.ANIME)
+    engine.warmup_all(Subject.ANIME)  # already warm: nothing runs again
+    assert slow.created == ["toonout", "birefnet-hr-matting"]  # current subject first
+    segs = {s.name: s for s in engine._segmenters.values()}
+    assert all(s.warmed == 1 for s in segs.values())
+    result = engine.remove_background(photo, Subject.PERSON)
+    assert result.timings["model_load"] < 0.1 and result.timings["inference"] < 0.15
+
+
+def test_warmup_all_only_warms_the_current_subject_when_one_fits(tmp_path, slow):
+    _install(tmp_path, "birefnet-hr-matting", "toonout")
+    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=slow, max_resident=1)
+    engine.warmup_all(Subject.PERSON)
+    assert slow.created == ["birefnet-hr-matting"]
+
+
+def test_warmup_skips_subjects_without_a_model(tmp_path, slow):
+    _install(tmp_path, "toonout")
+    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=slow, max_resident=2)
+    engine.warmup_all(Subject.PERSON)
+    assert slow.created == ["toonout"]
+
+
+def test_a_cutout_during_warmup_waits_instead_of_running_alongside(tmp_path, photo, slow):
+    _install(tmp_path, "birefnet-hr-matting")
+    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=slow, max_resident=2)
+    warm = threading.Thread(target=engine.warmup, args=(Subject.PERSON,))
+    warm.start()
+    time.sleep(0.05)  # the warm-up holds the GPU now
+    result = engine.remove_background(photo, Subject.PERSON)
+    warm.join()
+    assert not slow.overlap
+    assert result.timings["wait"] > 0.05 and result.timings["inference"] < 0.15  # ran warm
+
+
+def test_default_budget(monkeypatch):
+    from cutout.core import engine as engine_mod
+
+    monkeypatch.delenv("CUTOUT_MAX_LOADED_MODELS", raising=False)
+    monkeypatch.setattr(engine_mod.debug, "gpu_usage", lambda: [{"total_mib": 8192}])
+    assert engine_mod.default_max_resident("auto") == 2  # RTX 3070
+    monkeypatch.setattr(engine_mod.debug, "gpu_usage", lambda: [{"total_mib": 6144}])
+    assert engine_mod.default_max_resident("auto") == 1
+    monkeypatch.setattr(engine_mod.debug, "gpu_usage", lambda: [])
+    assert engine_mod.default_max_resident("auto") == 1  # unknown card: be careful
+    assert engine_mod.default_max_resident("cpu") == 2
+    monkeypatch.setenv("CUTOUT_MAX_LOADED_MODELS", "1")
+    assert engine_mod.default_max_resident("cpu") == 1
