@@ -96,7 +96,9 @@ cutout quality and the output keeps the full input size (nothing is cropped).
    YuNet is trained on photos but finds most front-facing anime faces too.
 2. **Cut at the neck**, square to the face's tilt (from the eye landmarks): 0.2 face
    heights below the chin under the face, rising to chin level beside the neck, so
-   raised shoulders stay off. Feathered over ~3% of the face height.
+   raised shoulders stay off. Below eye level nothing further than 0.9 face widths
+   from the middle of the face is kept (hair hanging beside the face fits; a shoulder
+   pushed up beside the head in a selfie doesn't). Feathered over ~3% of the face height.
 3. **Keep what is connected to the face** above that cut: hair, hats, buns. Parts that
    stick out of the head's core oval, rise from the shoulder line to far above eye level
    and are arm-thin are taken for raised arms and dropped.
