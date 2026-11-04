@@ -253,8 +253,26 @@ def test_a_damaged_download_is_refused(tmp_path):
     bad = tmp_path / "bad"
     shutil.copytree(out, bad)
     (bad / part.name).write_bytes(bytes(data))
-    with pytest.raises(client.UpdateError, match="damaged"):
+    # The damaged local copy is never used; with no network in the test, the fallback fails.
+    with pytest.raises(client.UpdateError):
         client.Downloader(plan, client.work_dir(manifest), mirrors=[bad]).run()
+
+
+def test_a_mismatched_local_copy_is_skipped_for_the_exact_file(tmp_path):
+    """Regression: a pack reused from the previous release is re-zipped locally under the same
+    name, but zips aren't byte-reproducible, so CI's install test failed its checksum twice and
+    gave up. A local file that isn't the exact part must be skipped, not copied and retried."""
+    app, out, manifest, _ = release(tmp_path, "0.1.1")
+    install = tmp_path / "install"
+    make_release.stage_setup(app, manifest, install)
+    plan = client.plan_update(client.local_status(root=install), manifest)
+    part = manifest.packs["model-toonout"].parts[0]
+    rezipped = tmp_path / "rezipped"
+    shutil.copytree(out, rezipped)
+    with zipfile.ZipFile(rezipped / part.name, "w") as zf:  # same name, different bytes
+        zf.writestr("models/toonout.onnx", b"not the released bytes")
+    adds = client.Downloader(plan, client.work_dir(manifest), mirrors=[rezipped, out]).run()
+    assert any(dest == "models/toonout.onnx" for _, dest in adds)
 
 
 def test_a_zip_with_unexpected_files_is_refused(tmp_path):

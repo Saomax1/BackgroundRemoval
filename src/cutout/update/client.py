@@ -334,7 +334,9 @@ class Downloader:
     def _fetch_to(self, part: Part, partial: Path, what: str) -> None:
         for mirror in self.mirrors:
             src = mirror / part.name
-            if src.is_file():
+            # A pack reused from an earlier release is re-zipped locally under the same name,
+            # but zips aren't byte-reproducible: only take a local copy that is the exact file.
+            if src.is_file() and src.stat().st_size == part.size and P.file_digest(src) == part.sha256:
                 with open(src, "rb") as fin, open(partial, "wb") as fout:
                     while chunk := fin.read(_CHUNK):
                         fout.write(chunk)
