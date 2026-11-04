@@ -53,7 +53,7 @@ from .models import (
     resolve_prompt_model,
 )
 from .prompt_segmenter import OnnxSamSegmenter, PromptSegmenter
-from .head import Face, FaceFinder, HeadCut, head_only
+from .head import Face, FaceFinder, HeadCut, describe, head_only
 from . import debug, parallel
 from .refine import ImagePrep, RefineOptions, compose_rgba, prepare_image, refine_alpha
 from .runtime import GpuOutOfMemory, is_out_of_memory
@@ -242,7 +242,7 @@ class CutoutEngine:
         cut = head_only(image.as_uint8(), alpha, subject, faces, self.face_finder)
         debug.record_timings(f"head only {image.width}x{image.height}",
                              {"head only": time.perf_counter() - t}, faces=len(cut.faces),
-                             drawn_by_user=faces is not None)
+                             drawn_by_user=faces is not None, kept=describe(cut.faces))
         return cut
 
     def warmup(self, subject: Subject = Subject.PERSON, progress: "WarmupProgress | None" = None) -> bool:
