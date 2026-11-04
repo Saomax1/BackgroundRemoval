@@ -247,3 +247,83 @@ def test_task_finishing_after_its_window_closed_does_not_crash(qapp):
     failing.setAutoDelete(False)
     shiboken6.delete(failing.signals)
     failing.run()
+
+
+# ------------------------------------------------------------ warm-up loading bar
+class _Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_warmup_tracker_moves_by_time_and_learns_durations(qapp, tmp_path):
+    from cutout.ui.warmup import WarmupTracker
+
+    settings = QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat)
+    clock = _Clock()
+    t = WarmupTracker(settings, clock=clock)
+    t.on_stage("plan", "birefnet-hr-matting,toonout")
+    assert t.active and t.fraction() == 0.0
+    # Defaults: person load 5 + warm 40, anime load 5 + warm 3 = 53 s.
+    t.on_stage("load", "birefnet-hr-matting")
+    assert "Loading the Person model (1 of 2)" in t.text()
+    clock.t += 2.5
+    assert t.fraction() == pytest.approx(2.5 / 53)
+    clock.t += 100  # stage overran: the bar waits just short of the stage end
+    assert t.fraction() == pytest.approx(0.95 * 5 / 53)
+    t.on_stage("warm", "birefnet-hr-matting")
+    assert "Warming up the Person model" in t.text()
+    clock.t += 30
+    t.on_stage("paused", "birefnet-hr-matting")
+    assert "paused" in t.text()
+    t.on_stage("warm", "birefnet-hr-matting")  # resumed: the run starts over
+    clock.t += 20
+    t.on_stage("load", "toonout")
+    assert "(2 of 2)" in t.text()
+    t.on_stage("done", "")
+    assert not t.active and t.fraction() == 1.0 and t.text() == "AI models ready"
+    # Measured times replace the defaults next start (the paused attempt is not recorded as is).
+    assert float(settings.value("warmup/birefnet-hr-matting/load")) == pytest.approx(102.5)
+    assert float(settings.value("warmup/birefnet-hr-matting/warm")) == pytest.approx(20)
+    assert t.expected("birefnet-hr-matting", "warm") == pytest.approx(20)
+
+
+def test_warmup_tracker_counts_skipped_stages_as_done(qapp):
+    from cutout.ui.warmup import WarmupTracker
+
+    clock = _Clock()
+    t = WarmupTracker(None, clock=clock)
+    t.on_stage("plan", "birefnet-hr-matting,toonout")
+    t.on_stage("warm", "toonout")  # person was already loaded and warm
+    assert t.fraction() == pytest.approx(50 / 53)
+
+
+def test_loading_bar_shows_during_startup_warmup_then_hides(window, tmp_path):
+    from cutout.ui.warmup import WarmupBar
+
+    panel = window.warmup_panel
+    status = window.warmup_status
+    assert isinstance(panel, WarmupBar)
+    seen = []
+    window.warmup_tracker.changed.connect(lambda: seen.append(panel.isVisible()))
+    window.warmup_in_background()
+    wait_until(lambda: window.warmup_tracker.plan and not window.warmup_tracker.active)
+    QApplication.processEvents()
+    assert True in seen  # was shown on the start screen while warming
+    assert not panel.isVisible() and not status.isVisible()
+
+
+def test_status_bar_loading_bar_only_shows_with_an_image_open(window, tmp_path):
+    t = window.warmup_tracker
+    t.on_stage("plan", "birefnet-general")
+    t.on_stage("load", "birefnet-general")
+    qapp_ = QApplication.instance()
+    qapp_.processEvents()
+    assert window.warmup_panel.isVisible() and not window.warmup_status.isVisible()
+    _open(window, _photo(tmp_path))
+    t.changed.emit()
+    assert window.warmup_status.isVisible() and not window.warmup_panel.isVisible()
+    t.on_stage("done", "")
+    assert not window.warmup_status.isVisible()

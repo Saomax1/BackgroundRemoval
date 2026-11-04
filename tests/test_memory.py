@@ -214,9 +214,30 @@ class _SlowFirstRun:
         _SlowFirstRun.active -= 1
         return disc_alpha(64, 64)
 
-    def warmup(self):
+    def warmup(self, cancel=None):
         self.warmed += 1
         self.predict(np.zeros((8, 8, 3), np.uint8))
+
+
+class _LongWarmup(_SlowFirstRun):
+    """A warm-up that takes ``seconds`` unless cancelled (like ORT's terminate flag)."""
+
+    seconds = 2.0
+    started = None
+    cancelled = 0
+
+    def warmup(self, cancel=None):
+        from cutout.core.segmenter import WarmupCancelled
+
+        self.warmed += 1
+        _LongWarmup.started.set()
+        end = time.perf_counter() + self.seconds
+        while time.perf_counter() < end:
+            if cancel is not None and cancel.is_set():
+                _LongWarmup.cancelled += 1
+                raise WarmupCancelled(self.name)
+            time.sleep(0.01)
+        self.runs += 1  # its first run is done: later predicts are fast
 
 
 @pytest.fixture
@@ -295,3 +316,72 @@ def test_default_budget(monkeypatch):
     assert engine_mod.default_max_resident("cpu") == 2
     monkeypatch.setenv("CUTOUT_MAX_LOADED_MODELS", "1")
     assert engine_mod.default_max_resident("cpu") == 1
+
+
+@pytest.fixture
+def long_warmup(slow):
+    _LongWarmup.started, _LongWarmup.cancelled = threading.Event(), 0
+    return _LongWarmup
+
+
+def test_cutout_for_another_model_interrupts_the_warmup_which_then_resumes(tmp_path, photo, long_warmup):
+    """v0.1.24 on a 3070: the first Anime cutout waited 23 s behind the Person warm-up."""
+    _install(tmp_path, "birefnet-hr-matting", "toonout")
+    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=long_warmup, max_resident=2)
+    engine.remove_background(photo, Subject.ANIME)  # anime loaded (as if warmed first)
+    warm = threading.Thread(target=engine.warmup, args=(Subject.PERSON,))
+    warm.start()
+    assert long_warmup.started.wait(5)
+    result = engine.remove_background(photo, Subject.ANIME)
+    assert result.timings["wait"] < 0.5  # not the whole 2 s warm-up
+    assert long_warmup.cancelled == 1
+    warm.join(10)
+    assert not warm.is_alive()
+    person = next(s for s in engine._segmenters.values() if s.name == "birefnet-hr-matting")
+    assert person.warmed == 2 and person.runs == 1  # resumed and finished after the cutout
+    assert "birefnet-hr-matting" in engine._warm
+
+
+def test_cutout_for_the_model_being_warmed_waits_for_it(tmp_path, photo, long_warmup):
+    _install(tmp_path, "birefnet-hr-matting")
+    long_warmup.seconds = 0.5
+    try:
+        engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=long_warmup, max_resident=2)
+        warm = threading.Thread(target=engine.warmup, args=(Subject.PERSON,))
+        warm.start()
+        assert long_warmup.started.wait(5)
+        result = engine.remove_background(photo, Subject.PERSON)
+        warm.join()
+        assert long_warmup.cancelled == 0
+        assert result.timings["inference"] < 0.15  # ran warm
+    finally:
+        long_warmup.seconds = 2.0
+
+
+def test_onnx_warmup_can_be_cancelled(tmp_path):
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    import dataclasses
+
+    from onnx import TensorProto, helper
+
+    from cutout.core.models import REGISTRY
+    from cutout.core.segmenter import OnnxSegmenter, WarmupCancelled
+
+    x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 32, 32])
+    y = helper.make_tensor_value_info("out", TensorProto.FLOAT, [1, 1, 32, 32])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [1])
+    node = helper.make_node("ReduceMean", ["input", "axes"], ["out"], keepdims=1)
+    model = helper.make_model(helper.make_graph([node], "g", [x], [y], initializer=[axes]),
+                              opset_imports=[helper.make_opsetid("", 18)])
+    model.ir_version = 9
+    onnx.save(model, tmp_path / "m.onnx")
+    spec = dataclasses.replace(REGISTRY["isnet-anime"], input_size=32)
+    seg = OnnxSegmenter(spec, tmp_path / "m.onnx", device="cpu")
+    seg.warmup(cancel=threading.Event())  # not cancelled: runs
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(WarmupCancelled):
+        seg.warmup(cancel=stop)
+    seg.cancel_warmup()  # nothing running: harmless
+    assert seg.predict(np.zeros((32, 32, 3), np.uint8)).shape == (32, 32)

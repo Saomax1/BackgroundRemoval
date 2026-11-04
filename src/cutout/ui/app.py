@@ -67,6 +67,9 @@ QComboBox QAbstractItemView {{
 QLabel#emptyTitle {{ color: #e8eaed; font-size: 22pt; font-weight: 600; }}
 QLabel#emptySub {{ color: #bdc1c6; font-size: 11pt; }}
 QLabel#emptyHint {{ color: #80868b; }}
+QLabel#warmupLabel {{ color: #bdc1c6; }}
+QProgressBar#warmupBar {{ background: #36373c; border: none; border-radius: 3px; }}
+QProgressBar#warmupBar::chunk {{ background: {ACCENT}; border-radius: 3px; }}
 
 QStatusBar {{ color: #bdc1c6; border-top: 1px solid #36373c; }}
 QStatusBar QLabel {{ color: #bdc1c6; padding: 0 10px; }}
