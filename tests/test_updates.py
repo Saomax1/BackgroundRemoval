@@ -241,20 +241,23 @@ def test_verified_state_is_reused_until_the_version_changes(tmp_path, monkeypatc
     assert [p.name for p in client.local_status(root=app).missing] == ["model-toonout"]
 
 
-def test_a_damaged_download_is_refused(tmp_path):
-    app, out, manifest, _ = release(tmp_path, "0.1.1")
+def test_a_damaged_download_is_refused(tmp_path, server, monkeypatch):
+    base, _handler = server
+    monkeypatch.setattr(client.time, "sleep", lambda s: None)
+    monkeypatch.setenv("NO_PROXY", "*")
+    app = make_app(tmp_path / "app")
+    out = tmp_path / "rel"
+    manifest, _ = make_release.build(app, out, "0.1.1", f"{base}/rel")
+    manifest.save(app / P.RELEASE_FILE)
     install = tmp_path / "install"
     make_release.stage_setup(app, manifest, install)
-    status = client.local_status(root=install)
-    plan = client.plan_update(status, manifest)
+    plan = client.plan_update(client.local_status(root=install), manifest)
     part = manifest.packs["model-toonout"].parts[0]
     data = bytearray((out / part.name).read_bytes())
     data[-30] ^= 0xFF
-    bad = tmp_path / "bad"
-    shutil.copytree(out, bad)
-    (bad / part.name).write_bytes(bytes(data))
+    (out / part.name).write_bytes(bytes(data))  # the server now hands out a corrupt file
     with pytest.raises(client.UpdateError, match="damaged"):
-        client.Downloader(plan, client.work_dir(manifest), mirrors=[bad]).run()
+        client.Downloader(plan, tmp_path / "work").run()
 
 
 def test_a_zip_with_unexpected_files_is_refused(tmp_path):
@@ -453,3 +456,61 @@ def test_cli_finishes_setup_from_a_local_folder(tmp_path, monkeypatch, capsys):
     assert client.local_status(root=install).missing == []
     assert main(["--update", "--manifest", str(out / "cutout-release.json")]) == 0
     assert "up to date" in capsys.readouterr().out
+
+
+# ------------------------------------------- reused packs and the release check
+
+
+def test_reused_packs_get_no_local_zip_even_if_one_is_lying_around(tmp_path):
+    _a1, _o1, v1, _ = release(tmp_path, "0.1.1")
+    out2 = tmp_path / "0.1.2-release"
+    out2.mkdir()
+    stale = out2 / v1.packs[P.GPU].parts[0].name
+    stale.write_bytes(b"a rebuild with different bytes under the same name")
+    _a2, out2, v2, _ = release(tmp_path, "0.1.2", {**FILES, "Cutout.exe": b"gui v2"}, previous=v1)
+    assert v2.packs[P.GPU].parts == v1.packs[P.GPU].parts
+    assert not stale.exists()
+    assert make_release.verify(v2, out2, remote_size=lambda url: None) == []
+
+
+def test_zips_are_reproducible(tmp_path):
+    make_app(tmp_path / "a")
+    make_release.write_zip(tmp_path / "a", list(FILES), tmp_path / "1.zip")
+    for f in (tmp_path / "a").rglob("*"):
+        if f.is_file():
+            os.utime(f, (1_900_000_000, 1_900_000_000))
+    make_release.write_zip(tmp_path / "a", list(FILES), tmp_path / "2.zip")
+    assert (tmp_path / "1.zip").read_bytes() == (tmp_path / "2.zip").read_bytes()
+
+
+def test_release_check_catches_mismatched_downloads(tmp_path):
+    _app, out, manifest, _ = release(tmp_path, "0.1.1")
+    assert make_release.verify(manifest, out) == []
+    part = manifest.packs["model-toonout"].parts[0]
+    (out / part.name).write_bytes(b"x" * part.size)
+    gone = manifest.packs[P.GPU].parts[0]
+    (out / gone.name).unlink()
+    problems = make_release.verify(manifest, out, remote_size=lambda url: gone.size + 1)
+    assert any("model-toonout" in p and "SHA-256" in p for p in problems)
+    assert any(gone.name in p and "bytes" in p for p in problems)
+
+
+def test_a_mismatched_local_copy_is_skipped_for_the_real_download(tmp_path, server, monkeypatch):
+    base, _handler = server
+    monkeypatch.setattr(client.time, "sleep", lambda s: None)
+    monkeypatch.setenv("NO_PROXY", "*")
+    app = make_app(tmp_path / "app")
+    manifest, _ = make_release.build(app, tmp_path / "rel", "0.1.1", f"{base}/rel")
+    manifest.save(app / P.RELEASE_FILE)
+    install = tmp_path / "install"
+    make_release.stage_setup(app, manifest, install)
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    for pack in manifest.packs.values():
+        for part in pack.parts:
+            (bad / part.name).write_bytes(b"\0" * part.size)  # right size, wrong bytes
+    status = client.local_status(root=install)
+    plan = client.plan_update(status, manifest)
+    adds = client.Downloader(plan, tmp_path / "work", mirrors=[bad]).run()
+    apply_in_python(client.write_apply_plan(install, plan, adds, tmp_path / "work", None, None))
+    assert client.local_status(root=install).missing == []

@@ -240,7 +240,10 @@ jobs:
             if (-not (Test-Path (Join-Path $dir $f))) { throw "missing $f after install" }
           }
 
-          "--- first start: fetch the GPU runtime and models (from this build's files, same code path as a download)"
+          # Parts new in this build come from dist/release; parts reused from an earlier
+          # release are downloaded from GitHub and SHA-256 checked, so nothing publishes
+          # unless every file the manifest points at really matches it.
+          "--- first start: fetch the GPU runtime and models"
           & $cli --version
           & $cli --update --manifest (Join-Path $dir "release.json") --from-dir dist/release
           if ($LASTEXITCODE) { throw "finishing the install failed" }
@@ -268,7 +271,7 @@ jobs:
           "--- update: a newer version where only the app part changed"
           "ci" | Set-Content dist/Cutout/_internal/cutout/ci-update-marker.txt
           python packaging/make_release.py dist/Cutout dist/release-next --version "$env:VERSION.1" `
-            --base-url "https://example.invalid/next" --previous dist/release/cutout-release.json --skip-reused
+            --base-url "https://example.invalid/next" --previous dist/release/cutout-release.json --no-check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $check = & $cli --check-updates --manifest dist/release-next/cutout-release.json | Out-String
           $check
