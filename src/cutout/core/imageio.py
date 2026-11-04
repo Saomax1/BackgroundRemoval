@@ -7,7 +7,7 @@ Rules this module guarantees (the rest of the app relies on them):
   resized, cropped or re-sampled.
 * Bit depth is preserved: 8-bit in -> 8-bit RGBA PNG out, 16-bit in -> 16-bit
   RGBA PNG out.
-* The embedded ICC colour profile is carried through to the PNG (8-bit path).
+* The embedded ICC colour profile is carried through to the PNG (8 and 16-bit).
 * Paths may contain any Unicode characters (OpenCV's own ``imread`` cannot do
   this on Windows, so we always decode from bytes).
 """
@@ -23,6 +23,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+
+from .png import encode_png
 
 SUPPORTED_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".jfif"}
@@ -97,25 +99,26 @@ def load_image(path: str | os.PathLike) -> LoadedImage:
 
 
 def save_png(path: str | os.PathLike, rgba: np.ndarray, icc_profile: bytes | None = None) -> None:
-    """Write an ``H x W x 4`` RGBA array (uint8 or uint16) as a PNG, atomically."""
-    path = Path(path)
+    """Write an ``H x W x 4`` RGBA array (uint8 or uint16) as a PNG, atomically.
+
+    Encoding runs on every CPU core (``png.encode_png``); the pixels are stored exactly.
+    """
+    write_png_bytes(path, encode_rgba_png(rgba, icc_profile))
+
+
+def encode_rgba_png(rgba: np.ndarray, icc_profile: bytes | None = None) -> bytes:
+    """The PNG file bytes ``save_png`` would write (so a save can be prepared ahead of time)."""
     if rgba.ndim != 3 or rgba.shape[2] != 4:
         raise ValueError(f"expected HxWx4 RGBA, got shape {rgba.shape}")
-
-    if rgba.dtype == np.uint8:
-        buf = io.BytesIO()
-        Image.fromarray(rgba, "RGBA").save(buf, "PNG", icc_profile=icc_profile, compress_level=6)
-        payload = buf.getvalue()
-    elif rgba.dtype == np.uint16:
-        # Pillow cannot write 16-bit RGBA; OpenCV can (ICC is not carried on this path).
-        ok, enc = cv2.imencode(".png", cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
-        if not ok:
-            raise OSError(f"PNG encoding failed for {path}")
-        payload = enc.tobytes()
-    else:
+    if rgba.dtype not in (np.uint8, np.uint16):
         raise TypeError(f"unsupported dtype {rgba.dtype}")
+    # 16-bit has twice the bytes and compresses less; level 3 keeps it about as fast as 8-bit.
+    return encode_png(rgba, icc_profile, level=6 if rgba.dtype == np.uint8 else 3)
 
-    _atomic_write(path, payload)
+
+def write_png_bytes(path: str | os.PathLike, payload: bytes) -> None:
+    """Atomically write already-encoded PNG bytes (from ``encode_rgba_png``)."""
+    _atomic_write(Path(path), payload)
 
 
 def _cv_to_rgb(arr: np.ndarray) -> np.ndarray:

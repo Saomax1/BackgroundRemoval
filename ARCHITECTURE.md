@@ -35,7 +35,10 @@ Click-to-select uses a separate *promptable* model, picked the same way (best in
 | SAM 2.1 Hiera-B+ (`sam2.1-hiera-base-plus`) | same | ~330 MB | `facebook/sam2.1-hiera-base-plus` |
 | SAM 2.1 Hiera-S (`sam2.1-hiera-small`) | same | ~190 MB | `facebook/sam2.1-hiera-small` |
 
-The encoder runs once per image, the decoder on every click.
+The encoder runs once per image, the decoder on every click. Click-to-select runs
+on the **CPU** by default (`CutoutEngine(select_device=...)`, or the
+`CUTOUT_SELECT_DEVICE` environment variable: `cpu`, `auto`, `cuda`), so it never
+competes with the automatic-removal model for graphics memory (see "CPU and GPU in tandem").
 `scripts/export_sam2_onnx.py <id> --check photo.jpg` builds the pair and compares
 it with the PyTorch predictor (**not yet run end-to-end**, same sandbox limit).
 If the installer is tight on space, ship B+ only; it is close to L for this use.
@@ -70,10 +73,41 @@ load_image ──► Segmenter.predict ──► refine_alpha ──► (user ed
 4. **Compose** (`refine.compose_rgba`): Blur-Fusion foreground estimation removes
    background colour bleeding into semi-transparent hair. Fully opaque pixels are
    bit-exact copies of the input. Output dtype matches input (8 or 16-bit).
-5. **Save** (`imageio.save_png`): atomic write, ICC embedded on the 8-bit path.
+5. **Save** (`imageio.save_png`): lossless PNG encoded on all cores (`png.py`),
+   atomic write, ICC profile embedded for 8 and 16-bit.
 
-Measured on a 24 MP photo on a 4-core CPU sandbox (no GPU there): refine about
-3 s, compose about 1 s, PNG encode a few seconds for worst-case noise images.
+### CPU and GPU in tandem
+
+The GPU runs only the network (at 1-2K). Everything at the photo's own resolution
+is CPU work, and it is arranged so the CPU is never idle while the GPU runs and
+never uses just one core:
+
+* **Overlap.** `remove_background` starts `refine.prepare_image` on a CPU thread
+  before the model runs: the guide image and its half of the guided filter, and the
+  photo on Blur-Fusion's coarse grids. Neither depends on the matte, so they are
+  ready when the GPU finishes.
+* **All cores.** Every per-pixel full-resolution step is cut into row strips and run
+  on a thread pool (`parallel.map_rows`; NumPy, OpenCV and zlib release the GIL).
+  Only per-pixel steps are split, so the output is bit-for-bit what the
+  single-threaded code gives (`tests/test_parallel.py` checks this). Neighbourhood
+  filters stay whole-image OpenCV calls, which are already multi-threaded.
+* **PNG on all cores.** `png.encode_png` filters and deflates strips in parallel the
+  way `pigz` does (each strip primed with the previous 32 KB, joined with sync
+  flushes, Adler-32 combined). Pixels are exact; files are about the size Pillow made.
+* **Save prepared ahead.** As soon as a cutout is shown, the window composes and
+  encodes the PNG in the background. Save then only writes the bytes. Any edit
+  (tracked by `CutoutDocument.revision`) makes that copy stale and Save composes afresh.
+* **Not done on purpose:** splitting one network between CPU and GPU. Copying
+  activations over PCIe costs more than the CPU adds; the GPU is 20-50x faster at it.
+
+`CUTOUT_CPU_THREADS` limits the thread count (`1` = single-threaded). The debug
+report has a "Timings" section with every step of the last cutouts and saves.
+
+Measured on a 24 MP photo on a 4-core CPU sandbox (no GPU there), CPU work after
+the model: before 7.1 s (refine 0.6, compose 1.7, PNG 4.7), now 2.7 s (refine
+0.35, compose 0.5, PNG 1.8) with 0.25 s more done while the model runs, and
+the compose + PNG part is done before the user presses Save. Peak RAM went down
+slightly. More cores scale these further.
 GPU inference time is not measured yet (no GPU or real models in the sandbox).
 
 ## Module boundaries
@@ -82,6 +116,8 @@ GPU inference time is not measured yet (no GPU or real models in the sandbox).
 src/cutout/
   core/            headless engine. No Qt imports, ever.
     imageio.py     load/save, the "no quality loss" guarantees
+    png.py         lossless PNG encoder that uses every core
+    parallel.py    row-strip thread pool for full-resolution per-pixel work
     models.py      ModelSpec registry, model selection, models dir
     runtime.py     ONNX Runtime sessions, CUDA/CPU selection
     segmenter.py   Segmenter protocol + OnnxSegmenter (pre/post-processing)

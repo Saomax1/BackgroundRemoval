@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -45,7 +46,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.engine import CutoutEngine, CutoutResult
-from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, load_image, save_png
+from ..core import debug, parallel
+from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, encode_rgba_png, load_image, write_png_bytes
 from ..core.models import REGISTRY, ModelNotInstalled, Subject
 from ..core.runtime import GpuOutOfMemory
 from ..core.refine import compose_rgba
@@ -202,6 +204,8 @@ class MainWindow(QMainWindow):
         self._tool_actions: dict[str, QAction] = {}
         self._active_tool: CanvasTool | None = None
         self._live_tasks: set[Task] = set()
+        # A save prepared in the background right after a cutout: (image, revision, decon, future).
+        self._save_prep: tuple[LoadedImage, int, bool, Any] | None = None
 
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
@@ -648,13 +652,34 @@ class MainWindow(QMainWindow):
                 "Saving over the original image would destroy it. Pick a different file name."))
             return
         image = self.doc.image
-        alpha = self.doc.snapshot_alpha()
         decon = self.doc.result.decontaminate if self.doc.result is not None else True
         undo_index = self.doc.undo_stack.index()
+        ready = self._prepared_save(image, decon)
+        alpha = self.doc.snapshot_alpha()  # the fallback if the prepared save failed
+        prep = self.doc.result.prep if self.doc.result is not None else None
         self._push_busy(f"Saving {path.name}…")
 
         def work():
-            save_png(path, compose_rgba(image, alpha, decon), image.icc_profile)
+            t = time.perf_counter()
+            payload = None
+            if ready is not None:
+                try:
+                    payload = ready.result()  # usually finished already; waits if not
+                except Exception as exc:  # noqa: BLE001 - fall back to a fresh encode
+                    log.warning("prepared save failed, encoding again: %s", exc)
+            fresh = payload is None
+            if payload is None:
+                rgba = compose_rgba(image, alpha, decon, prep)
+                payload = encode_rgba_png(rgba, image.icc_profile)
+                del rgba
+            t_write = time.perf_counter()
+            write_png_bytes(path, payload)
+            steps = {"compose+encode" if fresh else "wait for prepared PNG": t_write - t,
+                     "write": time.perf_counter() - t_write}
+            debug.record_timings(f"save {image.width}x{image.height}", steps,
+                                 prepared_in_background=not fresh, size=f"{len(payload) / 1e6:.1f} MB")
+            log.info("saved %s in %.2fs (%s)", path.name, time.perf_counter() - t,
+                     "composed on save" if fresh else "prepared in the background")
             return path
 
         def done(p: Path):
@@ -671,6 +696,36 @@ class MainWindow(QMainWindow):
             self._report_error("Couldn't save the PNG", exc)
 
         self.run_in_background(work, on_done=done, on_error=failed)
+
+    def _prepare_save_in_background(self) -> None:
+        """Compose and encode the PNG on the CPU as soon as a cutout is shown, so Save only
+        has to write the file. Thrown away if the matte changes before the user saves."""
+        doc = self.doc
+        if doc.image is None or doc.alpha is None:
+            self._save_prep = None
+            return
+        image, alpha = doc.image, doc.snapshot_alpha()
+        decon = doc.result.decontaminate if doc.result is not None else True
+        prep = doc.result.prep if doc.result is not None else None
+
+        def work():
+            t = time.perf_counter()
+            payload = encode_rgba_png(compose_rgba(image, alpha, decon, prep), image.icc_profile)
+            debug.record_timings(f"save prepared in background {image.width}x{image.height}",
+                                 {"compose+encode": time.perf_counter() - t}, size=f"{len(payload) / 1e6:.1f} MB")
+            return payload
+
+        self._save_prep = (image, doc.revision, decon, parallel.submit(work))
+
+    def _prepared_save(self, image: LoadedImage, decon: bool):
+        """The background-prepared PNG future for the matte as it is now, or ``None``."""
+        sp = self._save_prep
+        if sp is None:
+            return None
+        p_image, p_rev, p_decon, future = sp
+        if p_image is image and p_rev == self.doc.revision and p_decon == decon and not future.cancelled():
+            return future
+        return None
 
     # ---------------------------------------------------------------- view
     def set_backdrop(self, backdrop: Backdrop) -> None:
@@ -690,6 +745,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------- status / title
     def _on_image_changed(self) -> None:
         img = self.doc.image
+        self._save_prep = None  # the old image's prepared PNG is no use any more
         self.act_original.setChecked(False)
         self.canvas.set_show_original(False)
         if img is None:
@@ -713,6 +769,7 @@ class MainWindow(QMainWindow):
         if r is None:
             self.lbl_model.clear()
             return
+        self._prepare_save_in_background()
         spec = REGISTRY.get(r.model_id)
         name = spec.id if spec else r.model_id
         device = r.device.upper()

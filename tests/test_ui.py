@@ -93,6 +93,31 @@ def test_save_writes_full_resolution_png(window, tmp_path):
     assert not window.doc.is_modified
 
 
+def test_save_is_prepared_in_background_and_dropped_after_edits(window, tmp_path):
+    from cutout.core.refine import compose_rgba
+
+    src = _photo(tmp_path, 300, 200)
+    _open(window, src)
+    ready = window._prepared_save(window.doc.image, True)
+    assert ready is not None
+    wait_until(ready.done)
+    out = tmp_path / "prepared.png"
+    window.save_to(out)
+    wait_until(lambda: not window.is_busy and out.exists())
+    expected = compose_rgba(window.doc.image, window.doc.alpha)
+    assert np.array_equal(np.asarray(Image.open(out)), expected)
+
+    # Any edit makes the prepared PNG stale: the next save composes the edited matte.
+    from PySide6.QtCore import QRect
+
+    window.doc.push_patch(QRect(0, 0, 10, 10), np.ones((10, 10), np.float32))
+    assert window._prepared_save(window.doc.image, True) is None
+    out2 = tmp_path / "edited.png"
+    window.save_to(out2)
+    wait_until(lambda: not window.is_busy and out2.exists())
+    assert np.asarray(Image.open(out2))[5, 5, 3] == 255
+
+
 def test_refuses_to_overwrite_original(window, tmp_path):
     src = _photo(tmp_path)
     _open(window, src)
