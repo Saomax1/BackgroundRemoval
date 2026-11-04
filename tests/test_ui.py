@@ -60,12 +60,43 @@ def _photo(tmp_path, h=601, w=403, name="photo.png"):
 
 def _open(window, path):
     window.open_path(path)
+    wait_until(lambda: window.doc.has_image and not window.is_busy)
+    window.confirm_bar.button.click()
     wait_until(lambda: window.doc.has_alpha and not window.is_busy)
+
+
+def test_open_waits_for_remove_background_button(window, tmp_path):
+    window.open_path(_photo(tmp_path))
+    wait_until(lambda: window.doc.has_image and not window.is_busy)
+    for _ in range(20):  # give a wrongly started removal time to land
+        QApplication.processEvents()
+        time.sleep(0.005)
+    assert not window.doc.has_alpha and not window.is_busy
+    assert window.stack.currentWidget() is window.canvas  # the image is shown to check
+    assert window.confirm_bar.isVisible()
+    assert window.act_confirm.isEnabled()
+    assert window.act_rerun.text() == "Remove Background"
+    assert not window.act_save.isEnabled()
+
+    # Switching the subject before confirming only picks the model; nothing runs.
+    window.set_subject(Subject.ANIME)
+    assert not window.is_busy and not window.doc.has_alpha
+
+    subjects = []
+    real = window.engine.remove_background
+    window.engine.remove_background = lambda img, subj, *a, **k: (subjects.append(subj), real(img, subj, *a, **k))[1]
+    window.act_confirm.trigger()  # Enter
+    wait_until(lambda: window.doc.has_alpha and not window.is_busy)
+    assert not window.confirm_bar.isVisible()
+    assert not window.act_confirm.isEnabled()
+    assert window.act_rerun.text() == "Redo Auto"
+    assert subjects == [Subject.ANIME]  # the button used the subject picked beforehand
 
 
 def test_empty_state_then_open_runs_auto_removal(window, tmp_path):
     assert window.stack.currentWidget() is window.empty
     assert not window.act_save.isEnabled()
+    assert not window.confirm_bar.isVisible()
     _open(window, _photo(tmp_path))
     assert window.stack.currentWidget() is window.canvas
     assert window.doc.alpha.shape == (601, 403)
@@ -218,6 +249,8 @@ def test_missing_model_reports_friendly_error(qapp, tmp_path):
     errors = []
     w.task_failed.connect(errors.append)
     w.open_path(_photo(tmp_path))
+    wait_until(lambda: w.doc.has_image and not w.is_busy)
+    w.confirm_bar.button.click()
     wait_until(lambda: errors and not w.is_busy)
     assert "Model not installed" in errors[0]
     assert w.doc.has_image and not w.doc.has_alpha

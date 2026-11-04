@@ -1,7 +1,8 @@
 """The editor window: open or drop one image, remove the background, touch up, save.
 
-Flow: open -> automatic removal starts by itself -> preview over a checkerboard ->
-(optional) touch-up tools -> Save PNG at the exact input resolution.
+Flow: open -> the image is shown and waits -> the user checks Person / Anime and
+presses "Remove Background" -> preview over a checkerboard -> (optional) touch-up
+tools -> Save PNG at the exact input resolution.
 
 Every engine call runs on ``QThreadPool`` (see ``workers.py``); while one runs a
 busy overlay covers the canvas and the actions that would conflict are disabled.
@@ -87,7 +88,7 @@ class EmptyState(QWidget):
         title = QLabel("Drop an image here")
         title.setObjectName("emptyTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub = QLabel("People, anime and cartoon characters. The background is removed automatically.")
+        sub = QLabel("People, anime and cartoon characters. Open an image, check it, then press Remove Background.")
         sub.setObjectName("emptySub")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setWordWrap(True)
@@ -176,6 +177,40 @@ class BusyOverlay(QWidget):
         p.drawText(QRectF(spin.right() + 14, pill.top(), tw + 10, pill.height()), Qt.AlignmentFlag.AlignVCenter, self._text)
 
 
+class ConfirmBar(QWidget):
+    """Floats at the bottom of a freshly opened image: nothing runs until the user
+    checks the picture (and Person / Anime) and presses Remove Background."""
+
+    confirmed = Signal()
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setObjectName("confirmBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(20, 10, 10, 10)
+        row.setSpacing(14)
+        self.label = QLabel("Check the image and pick Person or Anime above, then")
+        self.label.setObjectName("confirmText")
+        self.button = QPushButton("Remove Background")
+        self.button.setObjectName("primaryButton")
+        self.button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.button.setToolTip("Start the automatic removal (Enter)")
+        self.button.clicked.connect(self.confirmed)
+        row.addWidget(self.label)
+        row.addWidget(self.button)
+        self.hide()
+
+    def place(self) -> None:
+        """Bottom centre of the parent, clear of the edge."""
+        self.adjustSize()
+        parent = self.parentWidget().rect()
+        w = min(self.sizeHint().width(), parent.width() - 32)
+        h = self.sizeHint().height()
+        self.setGeometry((parent.width() - w) // 2, parent.height() - h - 24, w, h)
+        self.raise_()
+
+
 # ================================================================ the window
 class MainWindow(QMainWindow):
     #: Emitted after an automatic cutout is installed (tests and tools can listen).
@@ -242,6 +277,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.canvas)
         self.setCentralWidget(self.stack)
         self.overlay = BusyOverlay(self.stack)
+        self.confirm_bar = ConfirmBar(self.stack)
+        self.confirm_bar.confirmed.connect(self.start_removal)
         self.canvas.zoom_changed.connect(self._on_zoom_changed)
         self.canvas.hover_pixel.connect(self._on_hover_pixel)
 
@@ -271,8 +308,11 @@ class MainWindow(QMainWindow):
         self.act_redo.setShortcuts([QKeySequence.StandardKey.Redo, QKeySequence("Ctrl+Y")])
         self.addAction(self.act_undo)
         self.addAction(self.act_redo)
-        self.act_rerun = a("Remove Background Again", self.start_removal, QKeySequence("Ctrl+R"),
-                           "Run the automatic removal again (undoable)")
+        self.act_rerun = a("Remove Background", self.start_removal, QKeySequence("Ctrl+R"),
+                           "Run the automatic removal (undoable)")
+        # Enter starts the first removal of a freshly opened image (same as the button).
+        self.act_confirm = a("Remove Background", self._confirm_removal)
+        self.act_confirm.setShortcuts([QKeySequence(Qt.Key.Key_Return), QKeySequence(Qt.Key.Key_Enter)])
         self.act_fit = a("Fit to Window", self.canvas.fit_to_window, QKeySequence("Ctrl+0"), "Fit the image in the window")
         self.act_100 = a("Actual Pixels", self.canvas.actual_pixels, QKeySequence("Ctrl+1"), "Zoom to 100%")
         self.act_zoom_in = a("Zoom In", self.canvas.zoom_in, QKeySequence.StandardKey.ZoomIn, "Zoom in")
@@ -329,7 +369,6 @@ class MainWindow(QMainWindow):
         self.subject_group.buttonClicked.connect(self._on_subject_clicked)
         tb.addWidget(seg)
         tb.addAction(self.act_rerun)
-        self.act_rerun.setText("Redo Auto")
         tb.addSeparator()
 
         # Tools are inserted before this marker by register_tool().
@@ -505,6 +544,10 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(has_alpha and not busy)
         self.act_close.setEnabled(has_img and not busy)
         self.act_rerun.setEnabled(has_img and not busy)
+        # Before the first cutout this is the "go" button; after it, a re-run.
+        self.act_rerun.setText("Redo Auto" if has_alpha else "Remove Background")
+        self.act_confirm.setEnabled(self._awaiting_confirm and not busy)
+        self._sync_confirm_bar()
         for act in (self.act_fit, self.act_100, self.act_zoom_in, self.act_zoom_out):
             act.setEnabled(has_img)
         self.act_original.setEnabled(has_alpha)
@@ -516,6 +559,26 @@ class MainWindow(QMainWindow):
             tool = self._tools[tid]
             act.setEnabled((has_alpha or not tool.needs_alpha) and not busy)
 
+    @property
+    def _awaiting_confirm(self) -> bool:
+        """An image is open but no cutout has been made for it yet."""
+        return self.doc.has_image and not self.doc.has_alpha
+
+    def _sync_confirm_bar(self) -> None:
+        bar = self.confirm_bar
+        show = self._awaiting_confirm and not self.is_busy
+        if show:
+            bar.place()
+            if not bar.isVisible():
+                bar.show()
+                bar.button.setFocus()
+        elif bar.isVisible():
+            bar.hide()
+
+    def _confirm_removal(self) -> None:
+        if self._awaiting_confirm and not self.is_busy:
+            self.start_removal()
+
     # -------------------------------------------------------------- opening
     def open_dialog(self) -> None:
         if self.is_busy or not self._confirm_discard():
@@ -526,7 +589,7 @@ class MainWindow(QMainWindow):
             self.open_path(path, confirmed=True)
 
     def open_path(self, path: str | os.PathLike, confirmed: bool = False) -> None:
-        """Load an image and start the automatic removal on it."""
+        """Load an image and show it; the removal waits for Remove Background."""
         path = Path(path)
         if self.is_busy:
             return
@@ -547,7 +610,7 @@ class MainWindow(QMainWindow):
         self._pop_busy()
         self._last_save_path = None
         self.doc.set_image(image)
-        self.start_removal()
+        self.statusBar().showMessage("Check the image, pick Person or Anime, then press Remove Background.", 8000)
 
     def _on_load_failed(self, exc: BaseException) -> None:
         self._pop_busy()
@@ -570,7 +633,8 @@ class MainWindow(QMainWindow):
     def set_subject(self, subject: Subject, rerun: bool = True) -> None:
         self.subject_buttons[Subject(subject)].setChecked(True)
         self.settings.setValue("subject", Subject(subject).value)
-        if rerun and self.doc.has_image and not self.is_busy:
+        # Before the first cutout, switching only picks the model the button will use.
+        if rerun and self.doc.has_alpha and not self.is_busy:
             self.start_removal()
 
     def _on_subject_clicked(self, _button) -> None:
@@ -891,3 +955,5 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if self.overlay.isVisible():
             self.overlay.setGeometry(self.stack.rect())
+        if self.confirm_bar.isVisible():
+            self.confirm_bar.place()
