@@ -12,7 +12,8 @@ input resolution. This document is the map for everyone building on the engine.
 | Inference | ONNX Runtime GPU, CUDA execution provider | Runs exported models without shipping PyTorch (~2.5 GB saved). CUDA 12 + cuDNN come as pip wheels (`onnxruntime-gpu[cuda,cudnn]`) and are loaded by `onnxruntime.preload_dlls()`, so the user installs nothing but the app. Falls back to CPU if CUDA fails. |
 | Image ops | NumPy + OpenCV (headless) + Pillow | OpenCV for fast filters and 16-bit PNG/TIFF, Pillow for EXIF, ICC and palette formats. Headless OpenCV avoids clashing with Qt. |
 | UI | PySide6 (Qt 6) | Native-feeling Windows UI, a fast `QGraphicsView` canvas for brushing at full resolution, Qt threads for keeping the UI responsive. |
-| Installer | PyInstaller one-folder build + Inno Setup 6.5.2+ | One `Setup.exe` (Inno's single-file limit is about 4 GB), desktop and Start-menu shortcuts, uninstaller. Models are copied into `{app}\models`. Built and smoke-tested in GitHub Actions; see `packaging/README.md`. |
+| Installer | PyInstaller one-folder build + Inno Setup 6.5.2+ | A small `Setup.exe` on GitHub Releases, desktop and Start-menu shortcuts, uninstaller. The GPU runtime and models are separate *packs* the app downloads on first start. Built, smoke-tested and published by GitHub Actions; see `packaging/README.md`. |
+| Updates | `cutout.update` + a PowerShell helper | Help > Check for Updates downloads only the packs whose content hash changed (usually just the app, tens of MB), checks every byte, then swaps files after the app exits with automatic rollback. Offline unless the user asks. |
 
 ## Models
 
@@ -34,7 +35,10 @@ Click-to-select uses a separate *promptable* model, picked the same way (best in
 | SAM 2.1 Hiera-B+ (`sam2.1-hiera-base-plus`) | same | ~330 MB | `facebook/sam2.1-hiera-base-plus` |
 | SAM 2.1 Hiera-S (`sam2.1-hiera-small`) | same | ~190 MB | `facebook/sam2.1-hiera-small` |
 
-The encoder runs once per image, the decoder on every click.
+The encoder runs once per image, the decoder on every click. Click-to-select runs
+on the **CPU** by default (`CutoutEngine(select_device=...)`, or the
+`CUTOUT_SELECT_DEVICE` environment variable: `cpu`, `auto`, `cuda`), so it never
+competes with the automatic-removal model for graphics memory (see "CPU and GPU in tandem").
 `scripts/export_sam2_onnx.py <id> --check photo.jpg` builds the pair and compares
 it with the PyTorch predictor (**not yet run end-to-end**, same sandbox limit).
 If the installer is tight on space, ship B+ only; it is close to L for this use.
@@ -48,6 +52,13 @@ If the installer is tight on space, ship B+ only; it is close to L for this use.
   `python -m cutout sample.jpg --model <id>`.
 * Choosing person vs anime is a UI toggle for now. Auto-detection (a tiny
   classifier) is a possible later improvement.
+
+Head only uses one more model, small enough to ship inside the app itself (so it
+arrives with an ordinary app update, no model pack):
+
+| Use | Model | Size | Source |
+|---|---|---|---|
+| Finding faces for Head only | **YuNet** 2023mar (`core/data/face_detection_yunet_2023mar.onnx`) | 230 KB | `opencv/opencv_zoo`, MIT licence. Run by OpenCV (`cv2.FaceDetectorYN`) on the CPU. |
 
 ## Pipeline
 
@@ -69,10 +80,66 @@ load_image ──► Segmenter.predict ──► refine_alpha ──► (user ed
 4. **Compose** (`refine.compose_rgba`): Blur-Fusion foreground estimation removes
    background colour bleeding into semi-transparent hair. Fully opaque pixels are
    bit-exact copies of the input. Output dtype matches input (8 or 16-bit).
-5. **Save** (`imageio.save_png`): atomic write, ICC embedded on the 8-bit path.
+5. **Save** (`imageio.save_png`): lossless PNG encoded on all cores (`png.py`),
+   atomic write, ICC profile embedded for 8 and 16-bit.
 
-Measured on a 24 MP photo on a 4-core CPU sandbox (no GPU there): refine about
-3 s, compose about 1 s, PNG encode a few seconds for worst-case noise images.
+### Head only
+
+`core/head.py`, `CutoutEngine.head_only(image, alpha, subject, faces=None)`. A step
+*after* the automatic removal: it changes the matte only, so the head keeps the full
+cutout quality and the output keeps the full input size (nothing is cropped).
+
+1. **Find the face(s).** YuNet runs on the CPU (tens of ms; nothing goes on the GPU)
+   on a copy of the area around the cutout, shrunk to 1280 px at most. Photos use
+   confidence 0.6, anime 0.4, then one retry at 0.25. Faces off the cutout and faces
+   much smaller than the biggest one are ignored; every other face's head is kept.
+   YuNet is trained on photos but finds most front-facing anime faces too.
+2. **Cut at the neck**, square to the face's tilt (from the eye landmarks): 0.2 face
+   heights below the chin under the face, rising to chin level beside the neck, so
+   raised shoulders stay off. Feathered over ~3% of the face height.
+3. **Keep what is connected to the face** above that cut: hair, hats, buns. Parts that
+   stick out of the head's core oval, rise from the shoulder line to far above eye level
+   and are arm-thin are taken for raised arms and dropped.
+
+When no face is found (a face turned away, a very stylised drawing) the window keeps
+the whole cutout and switches to the **Mark Face** tool (F): the user drags a box from
+forehead to chin and that box is used as the face. In the window, Head only is a
+switch (toolbar and next to Remove Background): before a cutout it says what the
+button makes; after one it cuts the head out or puts the whole cutout back, as
+undoable steps, without running the model again. `cutout --head` does it from the CLI.
+
+### CPU and GPU in tandem
+
+The GPU runs only the network (at 1-2K). Everything at the photo's own resolution
+is CPU work, and it is arranged so the CPU is never idle while the GPU runs and
+never uses just one core:
+
+* **Overlap.** `remove_background` starts `refine.prepare_image` on a CPU thread
+  before the model runs: the guide image and its half of the guided filter, and the
+  photo on Blur-Fusion's coarse grids. Neither depends on the matte, so they are
+  ready when the GPU finishes.
+* **All cores.** Every per-pixel full-resolution step is cut into row strips and run
+  on a thread pool (`parallel.map_rows`; NumPy, OpenCV and zlib release the GIL).
+  Only per-pixel steps are split, so the output is bit-for-bit what the
+  single-threaded code gives (`tests/test_parallel.py` checks this). Neighbourhood
+  filters stay whole-image OpenCV calls, which are already multi-threaded.
+* **PNG on all cores.** `png.encode_png` filters and deflates strips in parallel the
+  way `pigz` does (each strip primed with the previous 32 KB, joined with sync
+  flushes, Adler-32 combined). Pixels are exact; files are about the size Pillow made.
+* **Save prepared ahead.** As soon as a cutout is shown, the window composes and
+  encodes the PNG in the background. Save then only writes the bytes. Any edit
+  (tracked by `CutoutDocument.revision`) makes that copy stale and Save composes afresh.
+* **Not done on purpose:** splitting one network between CPU and GPU. Copying
+  activations over PCIe costs more than the CPU adds; the GPU is 20-50x faster at it.
+
+`CUTOUT_CPU_THREADS` limits the thread count (`1` = single-threaded). The debug
+report has a "Timings" section with every step of the last cutouts and saves.
+
+Measured on a 24 MP photo on a 4-core CPU sandbox (no GPU there), CPU work after
+the model: before 7.1 s (refine 0.6, compose 1.7, PNG 4.7), now 2.7 s (refine
+0.35, compose 0.5, PNG 1.8) with 0.25 s more done while the model runs, and
+the compose + PNG part is done before the user presses Save. Peak RAM went down
+slightly. More cores scale these further.
 GPU inference time is not measured yet (no GPU or real models in the sandbox).
 
 ## Module boundaries
@@ -81,12 +148,16 @@ GPU inference time is not measured yet (no GPU or real models in the sandbox).
 src/cutout/
   core/            headless engine. No Qt imports, ever.
     imageio.py     load/save, the "no quality loss" guarantees
+    png.py         lossless PNG encoder that uses every core
+    parallel.py    row-strip thread pool for full-resolution per-pixel work
     models.py      ModelSpec registry, model selection, models dir
     runtime.py     ONNX Runtime sessions, CUDA/CPU selection
     segmenter.py   Segmenter protocol + OnnxSegmenter (pre/post-processing)
     refine.py      upsample, guided filter, foreground estimation, compose
     engine.py      CutoutEngine: the public API the UI and CLI use
     prompt_segmenter.py  PromptSegmenter protocol + OnnxSamSegmenter (click-to-select model)
+    head.py        Head only: face finding (YuNet, data/) and the cut at the neck
+    debug.py       log files, debug mode, crash detection, memory snapshots, the debug report
   cli.py           command-line front end (dev, benchmarks, installer smoke test)
   editing/         touch-up tools, pure NumPy/OpenCV on the alpha matte, no Qt
     matte.py       MatteEditor: brush strokes, merging masks, tile-based undo (Patch, EditHistory)
@@ -94,7 +165,10 @@ src/cutout/
     select.py      ClickSelector: clicks -> full-res, edge-refined Selection
     rect.py        Rect: the dirty area every edit returns, for partial repaints
   ui/              PySide6 editor window (see "Editor window" below)
-packaging/         PyInstaller spec, Inno Setup script, model staging (packaging/README.md)
+    update_ui.py   Help > Check for Updates, the update and finish-setup dialog
+  update/          updater, no Qt: packs.py (how the install splits), manifest.py
+                   (cutout-release.json), client.py (check, download, apply), apply_update.ps1
+packaging/         PyInstaller spec, Inno Setup script, model staging, release packs (packaging/README.md)
 scripts/           build-time model download, export and checks
 ```
 
@@ -112,7 +186,43 @@ result.save_png(out)
 # after edits:
 rgba = compose_rgba(result.image, edited_alpha)
 save_png(out, rgba, result.image.icc_profile)
+result.notice       # None, or a message to show (e.g. "ran on the CPU because the GPU was full")
+engine.release_models()  # unload everything, e.g. before a memory-hungry step
 ```
+
+### GPU and RAM use
+
+- A fresh ONNX Runtime session is much slower on its first run (RTX 3070, person
+  2048: ~24 s first, ~7 s after). So with 7.5 GB+ of VRAM both automatic-removal
+  models stay loaded (`max_resident`, least recently used goes first; override
+  with `CUTOUT_MAX_LOADED_MODELS`), and the app warms the current subject's model
+  and then the other in the background at start (`warmup_all`). On smaller
+  cards only one stays loaded. A new model is loaded only after the evicted one
+  is dropped, and GPU runs are serialised (`_infer_lock`). Cutouts go first: a
+  cutout for another model stops a running warm-up through ONNX Runtime's
+  `RunOptions.terminate` (the warm-up resumes afterwards), and no warm-up starts
+  while a cutout is waiting. A cutout for the model being warmed waits for it
+  and then runs warm. The debug report's timings show
+  `wait`, `model_load` and `first_run_of_model` separately.
+- Sessions use `arena_extend_strategy=kSameAsRequested` and every run asks ORT
+  to shrink the GPU arena afterwards (`memory.enable_memory_arena_shrinkage`),
+  so activations are not parked in VRAM between runs. The CPU arena is off for
+  the same reason in RAM.
+- cuDNN uses `HEURISTIC` algorithm search with a capped workspace. `EXHAUSTIVE`
+  tries algorithms that want GB-sized scratch buffers and was enough on its own
+  to run out of VRAM.
+- On an out-of-memory error the engine unloads every model (including
+  click-to-select), retries on the GPU, and with `device="auto"` then runs that
+  one image on the CPU and sets `result.notice`. The CPU session isn't cached,
+  so the next image tries the GPU again. Otherwise it raises `GpuOutOfMemory`
+  with a readable message. Never recover inside the `except` block: the live
+  traceback keeps the failed session (and its VRAM) alive.
+- The exported deformable convolutions (`scripts/onnx_deform_conv.py`) sample
+  one kernel row at a time. Sampling all 49 taps of BiRefNet's 7x7 ASPP branch
+  at once made a 3.3 GB temporary at 2048 px, which ran an 8 GB RTX 3070 out of
+  memory or pushed it into the driver's system-memory fallback (25-51 s runs
+  instead of about 7 s).
+- Output resolution is unaffected by all of this: models run at their fixed size.
 
 ### Contracts for the follow-on work
 
@@ -168,7 +278,9 @@ save_png(out, rgba, result.image.icc_profile)
   calls `cutout.ui.main(argv)`) and `cutout-cli.exe` (console). Every DLL from
   the `nvidia-*` wheels is copied flat into `_internal\nvidia_dlls`, which
   `runtime.py` adds to the DLL search path before ORT loads CUDA. Models go in
-  `{app}\models`. The smoke test after install is `cutout-cli.exe --diagnose`,
+  `{app}\models`. Setup carries only the app, libraries and Qt; the app
+  downloads the rest on first start (`cutout.update`), so the window must open
+  even with no models or CUDA DLLs installed. The smoke test after install is `cutout-cli.exe --diagnose`,
   `--list-models` and one run per subject on a generated sample. New models only
   need a registry entry: `scripts/build_models.py` builds and checks every entry.
 
@@ -185,6 +297,8 @@ in the packaged `Cutout.exe`). Files in `src/cutout/ui`:
 | `canvas.py` | `CutoutCanvas`: `QGraphicsView` with screen-space checkerboard (or white/black), wheel zoom at cursor, drag/Space/middle-button pan, "show original" compare. |
 | `tools.py` | `CanvasTool` base + `ToolContext`: the hook the touch-up tools plug into. |
 | `workers.py` | `Task` on `QThreadPool`; results come back as signals on the UI thread. |
+| `head_tool.py` | Mark Face tool: drag a box over a face when Head only finds none (or the wrong one). |
+| `touchup.py` | Keep / Erase / Refine brushes and click-to-select on top of `cutout.editing`. `MatteBridge` keeps one `MatteEditor` (no own history) on the current matte and pushes each finished stroke or selection to the window's `QUndoStack` as a rect patch. Brush size is a diameter in image pixels (1 to 1000); under 5 px dabs snap to the pixel grid and paint whole pixels (`editing.brush.pixel_stamp`). |
 
 Behaviour worth knowing:
 

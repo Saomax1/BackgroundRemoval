@@ -9,6 +9,7 @@ a future click-to-select model can reuse the same shape).
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Protocol
 
@@ -16,7 +17,7 @@ import cv2
 import numpy as np
 
 from .models import ModelSpec, ResizeMode
-from .runtime import SessionInfo, create_session
+from .runtime import SessionInfo, create_session, run_options
 
 
 class Segmenter(Protocol):
@@ -36,6 +37,7 @@ class OnnxSegmenter:
         inp = self.session.get_inputs()[0]
         self._input_name = inp.name
         self._input_dtype = np.float16 if "float16" in inp.type else np.float32
+        self._run_opts = run_options(self.info)
 
     @property
     def name(self) -> str:
@@ -46,14 +48,44 @@ class OnnxSegmenter:
         return self.info
 
     def predict(self, rgb: np.ndarray) -> np.ndarray:
+        return self._predict(rgb, self._run_opts)
+
+    def _predict(self, rgb: np.ndarray, opts) -> np.ndarray:
         tensor, crop = preprocess(rgb, self.spec)
-        outputs = self.session.run(None, {self._input_name: tensor.astype(self._input_dtype)})
+        outputs = self.session.run(None, {self._input_name: tensor.astype(self._input_dtype)}, opts)
         return postprocess(outputs[self.spec.output_index], crop, self.spec)
 
-    def warmup(self) -> None:
-        """Run once on a blank image so cuDNN picks its kernels before the user's first click."""
+    def warmup(self, cancel: threading.Event | None = None) -> None:
+        """Run once on a blank image so the session's slow first run happens before the user's.
+
+        Raises ``WarmupCancelled`` if ``cancel`` is set (then call ``cancel_warmup()`` to stop
+        a run already in progress).
+        """
         s = self.spec.input_size
-        self.predict(np.zeros((s, s, 3), np.uint8))
+        opts = run_options(self.info)  # its own options, so cancelling never touches a user run
+        self._warm_opts = opts  # publish before checking ``cancel``: no window to miss a cancel
+        try:
+            if cancel is not None and cancel.is_set():
+                raise WarmupCancelled(self.spec.id)
+            self._predict(np.zeros((s, s, 3), np.uint8), opts)
+        except WarmupCancelled:
+            raise
+        except Exception as exc:
+            if opts.terminate:
+                raise WarmupCancelled(self.spec.id) from exc
+            raise
+        finally:
+            self._warm_opts = None
+
+    def cancel_warmup(self) -> None:
+        """Stop a warm-up running on another thread (ONNX Runtime checks between nodes)."""
+        opts = getattr(self, "_warm_opts", None)
+        if opts is not None:
+            opts.terminate = True
+
+
+class WarmupCancelled(RuntimeError):
+    """A background warm-up was stopped to let a cutout use the GPU first."""
 
 
 def preprocess(rgb: np.ndarray, spec: ModelSpec) -> tuple[np.ndarray, tuple[int, int, int, int]]:

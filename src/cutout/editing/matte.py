@@ -28,7 +28,7 @@ import numpy as np
 
 from ..core.imageio import LoadedImage
 from ..core.refine import RefineOptions, guided_filter
-from .brush import Brush, BrushMode, dab_centres, dab_rect, stamp
+from .brush import Brush, BrushMode, dab_centres, dab_rect, is_pixel_exact, pixel_stamp, snap_centre, stamp
 from .rect import Rect
 
 TILE = 256
@@ -280,10 +280,16 @@ class MatteEditor:
         b = s.brush
         radius = b.dab_radius(pressure)
         flow = np.float32(b.dab_flow(pressure))
+        exact = is_pixel_exact(radius)
+        if exact:
+            cx, cy = snap_centre(cx, cy, radius)
         rect = dab_rect(cx, cy, radius).clip(self.height, self.width)
         if rect.empty or flow <= 0:
             return Rect()
-        weights = stamp(cx, cy, radius, b.hardness, rect) * flow
+        if exact:
+            weights = pixel_stamp(cx, cy, radius, rect) * flow
+        else:
+            weights = stamp(cx, cy, radius, b.hardness, rect) * flow
         self._snapshot(rect)
         if b.mode is BrushMode.REFINE:
             refined = self._refined_region(rect)

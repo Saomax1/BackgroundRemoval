@@ -14,7 +14,7 @@ from __future__ import annotations
 from enum import Enum
 
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QLineF, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -23,6 +23,7 @@ from PySide6.QtGui import (
     QKeyEvent,
     QMouseEvent,
     QPainter,
+    QPen,
     QPixmap,
     QWheelEvent,
 )
@@ -32,7 +33,8 @@ from .document import CutoutDocument
 from .tools import CanvasTool
 
 MIN_ZOOM = 0.02
-MAX_ZOOM = 32.0
+MAX_ZOOM = 64.0
+PIXEL_GRID_FROM = 8.0  # zoom at which a grid shows each image pixel
 ZOOM_STEP = 1.25
 CHECKER_SIZE = 10  # screen pixels per checker square
 
@@ -233,6 +235,24 @@ class CutoutCanvas(QGraphicsView):
         else:
             painter.fillRect(area, QColor("white") if self._backdrop is Backdrop.WHITE else QColor("black"))
 
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        """When zoomed in far enough to edit single pixels, outline each one."""
+        if self._item is None or self.zoom < PIXEL_GRID_FROM:
+            return
+        area = self._item.boundingRect().intersected(rect)
+        if area.isEmpty():
+            return
+        x0, x1 = int(np.floor(area.left())), int(np.ceil(area.right()))
+        y0, y1 = int(np.floor(area.top())), int(np.ceil(area.bottom()))
+        pen = QPen(QColor(128, 128, 128, 90), 0)  # width 0 = 1 screen px at any zoom
+        painter.save()
+        painter.setPen(pen)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        lines = [QLineF(x, y0, x, y1) for x in range(x0, x1 + 1)]
+        lines += [QLineF(x0, y, x1, y) for y in range(y0, y1 + 1)]
+        painter.drawLines(lines)
+        painter.restore()
+
     # ------------------------------------------------------------- zooming
     def _set_zoom(self, z: float, anchor: QGraphicsView.ViewportAnchor | None = None) -> None:
         if self._item is None:
@@ -277,7 +297,10 @@ class CutoutCanvas(QGraphicsView):
 
     # --------------------------------------------------------------- input
     def _image_pos(self, event: QMouseEvent) -> QPointF:
-        return self.mapToScene(event.position().toPoint())
+        # Map the centre of the screen pixel under the pointer, in floating point, so a
+        # 1 px brush lands on exactly the image pixel the cursor is over at any zoom.
+        inv, ok = self.viewportTransform().inverted()
+        return inv.map(event.position() + QPointF(0.5, 0.5))
 
     def _tool_enabled(self) -> bool:
         if self._tool is None or self._item is None:

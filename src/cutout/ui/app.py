@@ -1,20 +1,23 @@
 """App entry point: theme, QApplication, main window.
 
-    python -m cutout.ui [image]
+    python -m cutout.ui [--debug] [image]
     cutout-gui [image]
     from cutout.ui import main; main(["photo.jpg"])   # what the packaged Cutout.exe does
 """
 
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+import logging
+
+from PySide6.QtCore import QSettings, Qt, QTimer, QtMsgType, qInstallMessageHandler
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
+from ..core import debug
+from . import debug_menu, update_ui
 from .main_window import APP_NAME, MainWindow
 
 ACCENT = "#5b8def"
@@ -25,13 +28,14 @@ QToolBar#mainToolbar {{
     background: #2a2b2f; border: none; border-bottom: 1px solid #36373c;
     padding: 6px 10px; spacing: 6px;
 }}
-QToolBar#mainToolbar QToolButton {{
+QToolBar#toolsToolbar {{ background: #2a2b2f; border: none; border-right: 1px solid #36373c; padding: 8px 6px; spacing: 4px; }}
+QToolBar#mainToolbar QToolButton, QToolBar#toolsToolbar QToolButton {{
     color: #e8eaed; background: transparent; border: 1px solid transparent;
     border-radius: 6px; padding: 5px 10px;
 }}
-QToolBar#mainToolbar QToolButton:hover {{ background: #36383d; }}
-QToolBar#mainToolbar QToolButton:checked {{ background: #3a4a6b; border-color: {ACCENT}; }}
-QToolBar#mainToolbar QToolButton:disabled {{ color: #6b6d72; }}
+QToolBar#mainToolbar QToolButton:hover, QToolBar#toolsToolbar QToolButton:hover {{ background: #36383d; }}
+QToolBar#mainToolbar QToolButton:checked, QToolBar#toolsToolbar QToolButton:checked {{ background: #3a4a6b; border-color: {ACCENT}; }}
+QToolBar#mainToolbar QToolButton:disabled, QToolBar#toolsToolbar QToolButton:disabled {{ color: #6b6d72; }}
 QToolBar#mainToolbar::separator {{ background: #3a3b40; width: 1px; margin: 4px 6px; }}
 QLabel#toolbarCaption {{ color: #9aa0a6; padding-right: 4px; }}
 
@@ -79,7 +83,12 @@ QSlider::handle:horizontal {{
 
 QLabel#emptyTitle {{ color: #e8eaed; font-size: 22pt; font-weight: 600; }}
 QLabel#emptySub {{ color: #bdc1c6; font-size: 11pt; }}
+QWidget#confirmBar {{ background: rgba(44, 46, 51, 240); border: 1px solid #4a4c52; border-radius: 12px; }}
+QLabel#confirmText {{ color: #e8eaed; font-size: 10.5pt; }}
 QLabel#emptyHint {{ color: #80868b; }}
+QLabel#warmupLabel {{ color: #bdc1c6; }}
+QProgressBar#warmupBar {{ background: #36373c; border: none; border-radius: 3px; }}
+QProgressBar#warmupBar::chunk {{ background: {ACCENT}; border-radius: 3px; }}
 
 QStatusBar {{ color: #bdc1c6; border-top: 1px solid #36373c; }}
 QStatusBar QLabel {{ color: #bdc1c6; padding: 0 10px; }}
@@ -130,9 +139,27 @@ def _set_windows_app_id() -> None:
             pass
 
 
+_QT_LEVELS = {
+    QtMsgType.QtDebugMsg: logging.DEBUG,
+    QtMsgType.QtInfoMsg: logging.INFO,
+    QtMsgType.QtWarningMsg: logging.WARNING,
+    QtMsgType.QtCriticalMsg: logging.ERROR,
+    QtMsgType.QtFatalMsg: logging.CRITICAL,
+}
+
+
+def _qt_message(mode, _context, message) -> None:
+    logging.getLogger("qt").log(_QT_LEVELS.get(mode, logging.INFO), "%s", message)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    debug_flag = "--debug" in args
+    args = [a for a in args if a != "--debug"]
+    # The saved Help > Debug Mode choice is read before Qt starts, so the whole run is logged.
+    saved = debug_menu.saved_preference(QSettings(APP_NAME, APP_NAME))
+    debug.setup(debug=debug_flag or saved or debug.env_requests_debug())
+    qInstallMessageHandler(_qt_message)
     _set_windows_app_id()
     app = QApplication.instance() or QApplication([sys.argv[0], *[a for a in args if a.startswith("-")]])
     app.setApplicationName(APP_NAME)
@@ -143,13 +170,17 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow()
     window.show()
+    QTimer.singleShot(0, lambda: debug_menu.offer_crash_report(window))
+    QTimer.singleShot(0, lambda: update_ui.on_startup(window))
     window.warmup_in_background()
 
     files = [a for a in args if not a.startswith("-")]
     if files:
         path = Path(files[0])
         QTimer.singleShot(0, lambda: window.open_path(path))
-    return app.exec()
+    code = app.exec()
+    debug.mark_clean_exit()
+    return code
 
 
 if __name__ == "__main__":  # pragma: no cover

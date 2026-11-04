@@ -5,9 +5,11 @@ Thin Qt adapters over the pure-NumPy core in ``cutout.editing``:
 * :class:`MatteBridge` keeps one ``MatteEditor`` on the document's matte (rebuilt
   when "Redo Auto" swaps the matte) and turns each finished edit into one undo
   step on the window's ``QUndoStack`` (only the changed rectangle is stored).
-* :class:`BrushTool` paints with a soft round brush whose size is set in
-  *screen* pixels, so zooming in automatically gives finer control. Alt swaps
-  Keep and Erase while held. ``[`` / ``]`` or Ctrl+wheel change the size.
+* :class:`BrushTool` paints with a round brush whose size is set in pixels of
+  the full-resolution image, from 1 px (exactly one pixel, no feathering) up to
+  1000 px. Size: slider, number box, "1 px" button, ``[`` / ``]`` or Ctrl+wheel.
+  Alt swaps Keep and Erase while held. Zoom in (up to 6400%, with a pixel grid
+  from 800%) to place single pixels.
 * :class:`SelectTool` runs SAM 2.1 clicks on a worker thread: left-click adds,
   right-click excludes, the selection is tinted blue, Enter keeps it and Delete
   removes it from the cutout.
@@ -20,20 +22,23 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QCursor, QImage, QKeyEvent, QMouseEvent, QPen, QPixmap
+from PySide6.QtGui import QBrush, QColor, QCursor, QImage, QKeyEvent, QMouseEvent, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSlider,
+    QSpinBox,
     QWidget,
 )
 
 from ..core.models import ModelNotInstalled
 from ..editing import Brush, BrushMode, MaskOp, MatteEditor, Patch, Rect, Selection
+from ..editing.brush import dab_rect, is_pixel_exact, pixel_stamp, snap_centre
 from .tools import CanvasTool, ToolContext
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -77,14 +82,19 @@ class MatteBridge:
 
 # ===================================================================== brush
 class BrushSettings(QObject):
-    """Shared by the three brushes, so switching Keep/Erase/Refine keeps the size."""
+    """Shared by the three brushes, so switching Keep/Erase/Refine keeps the size.
+
+    ``size`` is the brush diameter in *image* pixels, so 1 means exactly one pixel of
+    the full-resolution photo whatever the zoom. Brushes under 5 px paint whole pixels
+    with no feathering (see ``editing.brush.PIXEL_EXACT_BELOW``).
+    """
 
     changed = Signal()
-    MIN_SIZE, MAX_SIZE = 2, 400  # brush diameter in screen pixels
+    MIN_SIZE, MAX_SIZE = 1, 1000
 
-    def __init__(self, size: int = 60, softness: int = 40):
+    def __init__(self, size: int = 40, softness: int = 40):
         super().__init__()
-        self._size = size
+        self._size = int(min(self.MAX_SIZE, max(self.MIN_SIZE, size)))
         self._softness = softness
 
     @property
@@ -92,11 +102,21 @@ class BrushSettings(QObject):
         return self._size
 
     @size.setter
-    def size(self, value: int) -> None:
+    def size(self, value: float) -> None:
         value = int(min(self.MAX_SIZE, max(self.MIN_SIZE, round(value))))
         if value != self._size:
             self._size = value
             self.changed.emit()
+
+    def step(self, steps: float) -> None:
+        """Grow (steps > 0) or shrink the brush: 1 px at a time when small, ~15% when large."""
+        size = self._size
+        for _ in range(max(1, int(round(abs(steps))))):
+            if steps > 0:
+                size = size + 1 if size < 10 else max(size + 1, round(size * 1.15))
+            else:
+                size = size - 1 if size <= 10 else min(size - 1, round(size / 1.15))
+        self.size = size
 
     @property
     def softness(self) -> int:
@@ -114,6 +134,19 @@ class BrushSettings(QObject):
         return 1.0 - self._softness / 100.0
 
 
+SLIDER_STEPS = 1000  # the size slider is logarithmic: fine control at 1-10 px, still reaches 1000
+
+
+def _slider_to_size(v: int) -> int:
+    lo, hi = math.log(BrushSettings.MIN_SIZE), math.log(BrushSettings.MAX_SIZE)
+    return int(round(math.exp(lo + (hi - lo) * v / SLIDER_STEPS)))
+
+
+def _size_to_slider(size: int) -> int:
+    lo, hi = math.log(BrushSettings.MIN_SIZE), math.log(BrushSettings.MAX_SIZE)
+    return int(round((math.log(max(size, 1)) - lo) / (hi - lo) * SLIDER_STEPS))
+
+
 class BrushOptions(QWidget):
     def __init__(self, settings: BrushSettings):
         super().__init__()
@@ -122,22 +155,30 @@ class BrushOptions(QWidget):
         row.setContentsMargins(4, 0, 4, 0)
         row.setSpacing(8)
 
+        tip = "Brush size in pixels of the full-size image, 1 to 1000 ( [ and ] or Ctrl+wheel )"
         self.size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.size_slider.setRange(BrushSettings.MIN_SIZE, BrushSettings.MAX_SIZE)
-        self.size_slider.setFixedWidth(180)
-        self.size_slider.setToolTip("Brush size on screen ( [ and ] or Ctrl+wheel )")
-        self.size_label = QLabel()
-        self.size_label.setMinimumWidth(48)
+        self.size_slider.setRange(0, SLIDER_STEPS)
+        self.size_slider.setFixedWidth(200)
+        self.size_slider.setToolTip(tip)
+        self.size_box = QSpinBox()
+        self.size_box.setRange(BrushSettings.MIN_SIZE, BrushSettings.MAX_SIZE)
+        self.size_box.setSuffix(" px")
+        self.size_box.setToolTip(tip)
+        self.size_box.setKeyboardTracking(False)
+        self.one_px = QPushButton("1 px")
+        self.one_px.setObjectName("optionButton")
+        self.one_px.setToolTip("Single-pixel brush for the finest fixes (zoom in to see each pixel)")
         self.soft_slider = QSlider(Qt.Orientation.Horizontal)
         self.soft_slider.setRange(0, 100)
-        self.soft_slider.setFixedWidth(120)
-        self.soft_slider.setToolTip("Edge softness: 0 = hard edge, 100 = very soft")
-        self.hint = QLabel("Hold Alt to switch Keep ↔ Erase  ·  Esc cancels a stroke")
+        self.soft_slider.setFixedWidth(110)
+        self.soft_slider.setToolTip("Edge softness: 0 = hard edge, 100 = very soft. Brushes under 5 px are always hard.")
+        self.hint = QLabel("Alt swaps Keep ↔ Erase  ·  Esc cancels a stroke")
         self.hint.setObjectName("optionsHint")
 
         row.addWidget(QLabel("Size"))
         row.addWidget(self.size_slider)
-        row.addWidget(self.size_label)
+        row.addWidget(self.size_box)
+        row.addWidget(self.one_px)
         row.addSpacing(10)
         row.addWidget(QLabel("Softness"))
         row.addWidget(self.soft_slider)
@@ -145,18 +186,23 @@ class BrushOptions(QWidget):
         row.addWidget(self.hint)
         row.addStretch(1)
 
-        self.size_slider.valueChanged.connect(lambda v: setattr(settings, "size", v))
+        self.size_slider.valueChanged.connect(lambda v: setattr(settings, "size", _slider_to_size(v)))
+        self.size_box.valueChanged.connect(lambda v: setattr(settings, "size", v))
+        self.one_px.clicked.connect(lambda: setattr(settings, "size", 1))
         self.soft_slider.valueChanged.connect(lambda v: setattr(settings, "softness", v))
         settings.changed.connect(self._sync)
         self._sync()
 
     def _sync(self) -> None:
-        for slider, value in ((self.size_slider, self.settings.size), (self.soft_slider, self.settings.softness)):
-            if slider.value() != value:
-                slider.blockSignals(True)
-                slider.setValue(value)
-                slider.blockSignals(False)
-        self.size_label.setText(f"{self.settings.size} px")
+        pairs = ((self.size_slider, _size_to_slider(self.settings.size)),
+                 (self.size_box, self.settings.size),
+                 (self.soft_slider, self.settings.softness))
+        for widget, value in pairs:
+            if widget.value() != value:
+                widget.blockSignals(True)
+                widget.setValue(value)
+                widget.blockSignals(False)
+        self.soft_slider.setEnabled(not is_pixel_exact(self.settings.size / 2.0))
 
 
 class BrushTool(CanvasTool):
@@ -174,7 +220,7 @@ class BrushTool(CanvasTool):
         self.bridge = bridge
         self.settings = settings
         self._options = options
-        self._outline: list[QGraphicsEllipseItem] = []
+        self._outline: list[QGraphicsPathItem] = []
         self._hover: QPointF | None = None
         self._stroking = False
 
@@ -184,7 +230,7 @@ class BrushTool(CanvasTool):
         scene = ctx.canvas.scene()
         # Two rings (dark under light) so the outline shows on any colour.
         for color, width in ((QColor(0, 0, 0, 160), 3.0), (QColor(255, 255, 255, 230), 1.2)):
-            item = QGraphicsEllipseItem()
+            item = QGraphicsPathItem()
             pen = QPen(color, width)
             pen.setCosmetic(True)
             item.setPen(pen)
@@ -212,25 +258,47 @@ class BrushTool(CanvasTool):
     def options_widget(self) -> QWidget:
         return self._options
 
+    def _outline_too_small(self) -> bool:
+        zoom = self.ctx.canvas.image_to_view_scale() if self.ctx else 1.0
+        return self.settings.size * zoom < 8  # under ~8 screen px a ring is hard to see
+
     def cursor(self) -> QCursor:
-        return QCursor(Qt.CursorShape.BlankCursor if self._outline else Qt.CursorShape.CrossCursor)
+        # A crosshair marks the spot when the brush is too small on screen to see its ring.
+        if self._outline and not self._outline_too_small():
+            return QCursor(Qt.CursorShape.BlankCursor)
+        return QCursor(Qt.CursorShape.CrossCursor)
 
     # ------------------------------------------------------------------ size
     def image_radius(self) -> float:
-        zoom = self.ctx.canvas.image_to_view_scale() if self.ctx else 1.0
-        return max(0.5, self.settings.size / 2.0 / max(zoom, 1e-6))
+        """Brush radius in image pixels (size is a diameter in full-resolution pixels)."""
+        return max(0.5, self.settings.size / 2.0)
+
+    def outline_path(self, pos: QPointF) -> QPainterPath:
+        """The area a dab at ``pos`` paints: exact pixel cells for small brushes, else a circle."""
+        r = self.image_radius()
+        path = QPainterPath()
+        if is_pixel_exact(r):
+            cx, cy = snap_centre(pos.x(), pos.y(), r)
+            rect = dab_rect(cx, cy, r)
+            weights = pixel_stamp(cx, cy, r, rect)
+            for j, i in zip(*np.nonzero(weights)):
+                path.addRect(QRectF(rect.x + int(i), rect.y + int(j), 1, 1))
+            return path.simplified()
+        path.addEllipse(QRectF(pos.x() - r, pos.y() - r, 2 * r, 2 * r))
+        return path
 
     def _update_outline(self) -> None:
         if not self._outline:
             return
+        if self.ctx is not None:
+            self.ctx.canvas.viewport().setCursor(self.cursor())
         if self._hover is None:
             for item in self._outline:
                 item.setVisible(False)
             return
-        r = self.image_radius()
-        rect = QRectF(self._hover.x() - r, self._hover.y() - r, 2 * r, 2 * r)
+        path = self.outline_path(self._hover)
         for item in self._outline:
-            item.setRect(rect)
+            item.setPath(path)
             item.setVisible(True)
 
     def view_changed(self) -> None:
@@ -242,17 +310,17 @@ class BrushTool(CanvasTool):
 
     def wheel_with_modifier(self, delta_steps: float, modifiers) -> bool:
         if modifiers & Qt.KeyboardModifier.ControlModifier:
-            self.settings.size = self.settings.size * (1.15 ** delta_steps)
+            self.settings.step(delta_steps)
             return True
         return False
 
     def key_press(self, event: QKeyEvent) -> bool:
         key = event.key()
         if key == Qt.Key.Key_BracketLeft:
-            self.settings.size = min(self.settings.size - 1, self.settings.size / 1.2)
+            self.settings.step(-1)
             return True
         if key == Qt.Key.Key_BracketRight:
-            self.settings.size = max(self.settings.size + 1, self.settings.size * 1.2)
+            self.settings.step(1)
             return True
         if key == Qt.Key.Key_Escape and self._stroking:
             self._cancel()
@@ -560,7 +628,14 @@ class SelectTool(CanvasTool):
 def install_touchup_tools(window: "MainWindow") -> dict[str, CanvasTool]:
     """Register the brushes and click-to-select on the window. Returns them by id."""
     bridge = MatteBridge(window.doc)
-    settings = BrushSettings()
+    try:
+        size = int(window.settings.value("brush_size", 40))
+        softness = int(window.settings.value("brush_softness", 40))
+    except (TypeError, ValueError):
+        size, softness = 40, 40
+    settings = BrushSettings(size, softness)
+    settings.changed.connect(lambda: (window.settings.setValue("brush_size", settings.size),
+                                      window.settings.setValue("brush_softness", settings.softness)))
     options = BrushOptions(settings)
     tools: dict[str, CanvasTool] = {}
     for mode, key in ((BrushMode.KEEP, "K"), (BrushMode.ERASE, "E"), (BrushMode.REFINE, "R")):

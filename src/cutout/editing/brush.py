@@ -50,6 +50,31 @@ class Brush:
         return self.opacity * (pressure if self.pressure_opacity else 1.0)
 
 
+# Brushes narrower than this (in image pixels) paint whole pixels with no feathering, so a
+# 1 px brush changes exactly one pixel fully instead of half-covering a few.
+PIXEL_EXACT_BELOW = 5.0
+
+
+def is_pixel_exact(radius: float) -> bool:
+    return 2.0 * radius < PIXEL_EXACT_BELOW
+
+
+def snap_centre(cx: float, cy: float, radius: float) -> tuple[float, float]:
+    """Put a pixel-exact dab on the pixel grid: odd diameters on a pixel centre, even on a corner."""
+    diameter = max(1, round(2.0 * radius))
+    if diameter % 2:
+        return math.floor(cx) + 0.5, math.floor(cy) + 0.5
+    return float(round(cx)), float(round(cy))
+
+
+def pixel_stamp(cx: float, cy: float, radius: float, rect: Rect) -> np.ndarray:
+    """Hard 0/1 weights: pixels whose centre is within ``radius`` of the (snapped) centre."""
+    xs = np.arange(rect.x, rect.x1, dtype=np.float32) + np.float32(0.5 - cx)
+    ys = np.arange(rect.y, rect.y1, dtype=np.float32) + np.float32(0.5 - cy)
+    d = np.sqrt(ys[:, None] ** 2 + xs[None, :] ** 2)
+    return (d <= np.float32(radius + 1e-4)).astype(np.float32)
+
+
 def dab_rect(cx: float, cy: float, radius: float) -> Rect:
     return Rect.from_bounds(cx - radius, cy - radius, cx + radius, cy + radius)
 

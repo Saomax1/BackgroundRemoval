@@ -41,6 +41,14 @@ class CutoutDocument(QObject):
         self.result: CutoutResult | None = None
         self.undo_stack = QUndoStack(self)
         self.undo_stack.setUndoLimit(UNDO_LIMIT)
+        # Bumped on every change to the image or matte (edits, undo, redo, new results),
+        # so work prepared from a snapshot (a save prepared ahead) can tell it is still current.
+        self.revision = 0
+        self.alpha_changed.connect(self._bump_revision)
+        self.image_changed.connect(self._bump_revision)
+
+    def _bump_revision(self, *_args) -> None:
+        self.revision += 1
 
     # ----------------------------------------------------------------- state
     @property
@@ -97,6 +105,14 @@ class CutoutDocument(QObject):
         self.result_changed.emit()
 
     # ------------------------------------------------------------- editing
+    def replace_alpha(self, alpha: np.ndarray, text: str) -> None:
+        """Swap in a whole new matte (e.g. Head only) as one undo step."""
+        if self.alpha is None or self.image is None:
+            raise RuntimeError("no matte to replace yet")
+        if alpha.shape != self.alpha.shape:
+            raise ValueError(f"matte {alpha.shape} does not match the image {self.alpha.shape}")
+        self.undo_stack.push(_ReplaceAlphaCommand(self, np.ascontiguousarray(alpha, dtype=np.float32), text))
+
     def notify_alpha_changed(self, rect: QRect) -> None:
         """Tell views that ``rect`` of ``alpha`` was edited in place (no undo entry)."""
         rect = rect.intersected(self.full_rect())
@@ -141,7 +157,8 @@ class CutoutDocument(QObject):
             raise RuntimeError("nothing to export")
         if decontaminate is None:
             decontaminate = self.result.decontaminate if self.result is not None else True
-        return compose_rgba(self.image, self.alpha.copy(), decontaminate)
+        prep = self.result.prep if self.result is not None else None
+        return compose_rgba(self.image, self.alpha.copy(), decontaminate, prep)
 
     def snapshot_alpha(self) -> np.ndarray:
         """A copy of the matte, for handing to a worker thread while the user keeps editing."""

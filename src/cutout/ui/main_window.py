@@ -1,7 +1,8 @@
 """The editor window: open or drop one image, remove the background, touch up, save.
 
-Flow: open -> automatic removal starts by itself -> preview over a checkerboard ->
-(optional) touch-up tools -> Save PNG at the exact input resolution.
+Flow: open -> the image is shown and waits -> the user checks Person / Anime and
+presses "Remove Background" -> preview over a checkerboard -> (optional) touch-up
+tools -> Save PNG at the exact input resolution.
 
 Every engine call runs on ``QThreadPool`` (see ``workers.py``); while one runs a
 busy overlay covers the canvas and the actions that would conflict are disabled.
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +31,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -44,12 +47,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import numpy as np
+
 from ..core.engine import CutoutEngine, CutoutResult
-from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, load_image, save_png
+from ..core.head import Face, HeadCut, NoFaceFound
+from ..core import debug, parallel
+from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, encode_rgba_png, load_image, write_png_bytes
 from ..core.models import REGISTRY, ModelNotInstalled, Subject
+from ..core.runtime import GpuOutOfMemory
+from .warmup import WarmupBar, WarmupTracker
 from ..core.refine import compose_rgba
+from . import debug_menu, update_ui
 from .canvas import Backdrop, CutoutCanvas
 from .document import CutoutDocument
+from .head_tool import HeadBoxTool
 from .tools import CanvasTool, PanTool, ToolContext
 from .workers import Task
 
@@ -65,6 +76,11 @@ def is_supported_image(path: str | os.PathLike) -> bool:
 
 def default_output_path(source: Path) -> Path:
     return source.with_name(f"{source.stem}_cutout.png")
+
+
+HEAD_ONLY_TIP = "Keep only the head (face, hair and hat), cut at the neck; everything else transparent"
+NO_FACE_TEXT = ("No face was found, so Cutout can't tell where the head is.\n\n"
+                "Drag a box over the face, from the forehead to the chin, and only that head will be kept.")
 
 
 # ============================================================== small widgets
@@ -83,7 +99,7 @@ class EmptyState(QWidget):
         title = QLabel("Drop an image here")
         title.setObjectName("emptyTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub = QLabel("People, anime and cartoon characters. The background is removed automatically.")
+        sub = QLabel("People, anime and cartoon characters. Open an image, check it, then press Remove Background.")
         sub.setObjectName("emptySub")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setWordWrap(True)
@@ -101,6 +117,12 @@ class EmptyState(QWidget):
         layout.addWidget(button, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addSpacing(6)
         layout.addWidget(formats)
+        self._layout = layout
+
+    def add_footer(self, widget: QWidget) -> None:
+        """Put ``widget`` (the model loading bar) under the drop-zone text."""
+        self._layout.addSpacing(28)
+        self._layout.addWidget(widget, 0, Qt.AlignmentFlag.AlignCenter)
 
     def set_drag_hover(self, on: bool) -> None:
         self._hover = on
@@ -172,6 +194,45 @@ class BusyOverlay(QWidget):
         p.drawText(QRectF(spin.right() + 14, pill.top(), tw + 10, pill.height()), Qt.AlignmentFlag.AlignVCenter, self._text)
 
 
+class ConfirmBar(QWidget):
+    """Floats at the bottom of a freshly opened image: nothing runs until the user
+    checks the picture (and Person / Anime) and presses Remove Background."""
+
+    confirmed = Signal()
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setObjectName("confirmBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(20, 10, 10, 10)
+        row.setSpacing(14)
+        self.label = QLabel("Check the image and pick Person or Anime above, then")
+        self.label.setObjectName("confirmText")
+        self.button = QPushButton("Remove Background")
+        self.button.setObjectName("primaryButton")
+        self.button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.button.setToolTip("Start the automatic removal (Enter)")
+        self.button.clicked.connect(self.confirmed)
+        self.head_only = QCheckBox("Head only")
+        self.head_only.setObjectName("confirmHeadOnly")
+        self.head_only.setToolTip(HEAD_ONLY_TIP)
+        self.head_only.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.addWidget(self.label)
+        row.addWidget(self.head_only)
+        row.addWidget(self.button)
+        self.hide()
+
+    def place(self) -> None:
+        """Bottom centre of the parent, clear of the edge."""
+        self.adjustSize()
+        parent = self.parentWidget().rect()
+        w = min(self.sizeHint().width(), parent.width() - 32)
+        h = self.sizeHint().height()
+        self.setGeometry((parent.width() - w) // 2, parent.height() - h - 24, w, h)
+        self.raise_()
+
+
 # ================================================================ the window
 class MainWindow(QMainWindow):
     #: Emitted after an automatic cutout is installed (tests and tools can listen).
@@ -180,6 +241,8 @@ class MainWindow(QMainWindow):
     saved = Signal(str)
     #: Emitted when a background task failed, with a user-facing message.
     task_failed = Signal(str)
+    #: Emitted when Head only found no face (the Mark Face tool is then active).
+    head_not_found = Signal()
 
     def __init__(
         self,
@@ -202,6 +265,13 @@ class MainWindow(QMainWindow):
         self._active_tool: CanvasTool | None = None
         self._live_tasks: set[Task] = set()
         self._option_actions: dict[int, QAction] = {}  # id(widget) -> its action in the options bar
+        # A save prepared in the background right after a cutout: (image, revision, decon, future).
+        self._save_prep: tuple[LoadedImage, int, bool, Any] | None = None
+        # The whole cutout from before the last Head only, so Head only can be switched off
+        # (or the head re-marked) without running the model again. None when no head cut is shown.
+        self._full_alpha: np.ndarray | None = None
+
+        self.warmup_tracker = WarmupTracker(self.settings, parent=self)
 
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
@@ -213,6 +283,8 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_menus()
         self._build_statusbar()
+        debug_menu.install(self)
+        update_ui.install(self)
 
         self.doc.image_changed.connect(self._on_image_changed)
         self.doc.result_changed.connect(self._on_result_changed)
@@ -221,6 +293,8 @@ class MainWindow(QMainWindow):
         self.doc.undo_stack.indexChanged.connect(self._on_doc_edited)
 
         self.register_tool(PanTool(), shortcut="H")
+        self.head_tool = HeadBoxTool(self.mark_face)
+        self.register_tool(self.head_tool, shortcut="F")
         if touchup_tools:
             from .touchup import install_touchup_tools
 
@@ -235,11 +309,16 @@ class MainWindow(QMainWindow):
         self.canvas = CutoutCanvas(self.doc)
         self.empty = EmptyState()
         self.empty.open_requested.connect(self.open_dialog)
+        self.warmup_panel = WarmupBar(self.warmup_tracker)
+        self.empty.add_footer(self.warmup_panel)
         self.stack = QStackedWidget()
         self.stack.addWidget(self.empty)
         self.stack.addWidget(self.canvas)
         self.setCentralWidget(self.stack)
         self.overlay = BusyOverlay(self.stack)
+        self.confirm_bar = ConfirmBar(self.stack)
+        self.confirm_bar.confirmed.connect(self.start_removal)
+        self.confirm_bar.head_only.toggled.connect(lambda on: self.act_head.setChecked(on))
         self.canvas.zoom_changed.connect(self._on_zoom_changed)
         self.canvas.hover_pixel.connect(self._on_hover_pixel)
 
@@ -269,8 +348,16 @@ class MainWindow(QMainWindow):
         self.act_redo.setShortcuts([QKeySequence.StandardKey.Redo, QKeySequence("Ctrl+Y")])
         self.addAction(self.act_undo)
         self.addAction(self.act_redo)
-        self.act_rerun = a("Remove Background Again", self.start_removal, QKeySequence("Ctrl+R"),
-                           "Run the automatic removal again (undoable)")
+        self.act_rerun = a("Remove Background", self.start_removal, QKeySequence("Ctrl+R"),
+                           "Run the automatic removal (undoable)")
+        # Enter starts the first removal of a freshly opened image (same as the button).
+        self.act_confirm = a("Remove Background", self._confirm_removal)
+        self.act_confirm.setShortcuts([QKeySequence(Qt.Key.Key_Return), QKeySequence(Qt.Key.Key_Enter)])
+        # Head only: before a cutout it says what the button will make; after one it cuts the
+        # head out of it (or puts the whole cutout back) as an undoable step.
+        self.act_head = a("Head Only", None, None, HEAD_ONLY_TIP, checkable=True)
+        self.act_head.toggled.connect(self._on_head_mode_changed)
+        self.act_head.triggered.connect(self._on_head_triggered)
         self.act_fit = a("Fit to Window", self.canvas.fit_to_window, QKeySequence("Ctrl+0"), "Fit the image in the window")
         self.act_100 = a("Actual Pixels", self.canvas.actual_pixels, QKeySequence("Ctrl+1"), "Zoom to 100%")
         self.act_zoom_in = a("Zoom In", self.canvas.zoom_in, QKeySequence.StandardKey.ZoomIn, "Zoom in")
@@ -336,12 +423,20 @@ class MainWindow(QMainWindow):
         self.subject_buttons[Subject.PERSON].setChecked(True)
         self.subject_group.buttonClicked.connect(self._on_subject_clicked)
         tb.addWidget(seg)
+        tb.addAction(self.act_head)
         tb.addAction(self.act_rerun)
-        self.act_rerun.setText("Redo Auto")
         tb.addSeparator()
 
-        # Tools are inserted before this marker by register_tool().
-        self._tools_marker = tb.addSeparator()
+        # Canvas tools (Move, Mark Face, brushes, Select) live in a column on the left,
+        # so the top row keeps room for the cutout controls and Save.
+        lt = QToolBar("Tools")
+        lt.setObjectName("toolsToolbar")
+        lt.setOrientation(Qt.Orientation.Vertical)
+        lt.setMovable(False)
+        lt.setFloatable(False)
+        lt.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, lt)
+        self.tools_bar = lt
 
         # Fixed short labels on the toolbar; the menu items say what will be undone.
         self.tb_undo = QAction("Undo", self)
@@ -393,6 +488,7 @@ class MainWindow(QMainWindow):
         m.addAction(self.act_undo)
         m.addAction(self.act_redo)
         m.addSeparator()
+        m.addAction(self.act_head)
         m.addAction(self.act_rerun)
         self.tools_menu = mb.addMenu("&Tools")
         m = mb.addMenu("&View")
@@ -412,7 +508,11 @@ class MainWindow(QMainWindow):
         self.lbl_model.setObjectName("modelBadge")
         self.lbl_pixel = QLabel()
         self.lbl_zoom = QLabel()
-        for w in (self.lbl_file, self.lbl_model, self.lbl_pixel, self.lbl_zoom):
+        # While an image is open the start screen is hidden, so the loading bar moves here.
+        self.warmup_status = WarmupBar(
+            self.warmup_tracker, compact=True, show_when=lambda: self.stack.currentWidget() is self.canvas
+        )
+        for w in (self.warmup_status, self.lbl_file, self.lbl_model, self.lbl_pixel, self.lbl_zoom):
             sb.addPermanentWidget(w)
         self.lbl_zoom.setMinimumWidth(52)
         self.lbl_pixel.setMinimumWidth(140)
@@ -448,7 +548,7 @@ class MainWindow(QMainWindow):
         act.setStatusTip(tool.tooltip or tool.label)
         act.triggered.connect(lambda _c=False, tid=tool.id: self.activate_tool(tid))
         self.tool_group.addAction(act)
-        self.toolbar.insertAction(self._tools_marker, act)
+        self.tools_bar.addAction(act)
         self.tools_menu.addAction(act)
         self.addAction(act)
         self._tools[tool.id] = tool
@@ -537,6 +637,11 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(has_alpha and not busy)
         self.act_close.setEnabled(has_img and not busy)
         self.act_rerun.setEnabled(has_img and not busy)
+        self.act_head.setEnabled(has_img and not busy)
+        # Before the first cutout this is the "go" button; after it, a re-run.
+        self.act_rerun.setText("Redo Auto" if has_alpha else "Remove Background")
+        self.act_confirm.setEnabled(self._awaiting_confirm and not busy)
+        self._sync_confirm_bar()
         for act in (self.act_fit, self.act_100, self.act_zoom_in, self.act_zoom_out):
             act.setEnabled(has_img)
         self.act_original.setEnabled(has_alpha)
@@ -550,6 +655,26 @@ class MainWindow(QMainWindow):
             tool = self._tools[tid]
             act.setEnabled((has_alpha or not tool.needs_alpha) and not busy)
 
+    @property
+    def _awaiting_confirm(self) -> bool:
+        """An image is open but no cutout has been made for it yet."""
+        return self.doc.has_image and not self.doc.has_alpha
+
+    def _sync_confirm_bar(self) -> None:
+        bar = self.confirm_bar
+        show = self._awaiting_confirm and not self.is_busy
+        if show:
+            bar.place()
+            if not bar.isVisible():
+                bar.show()
+                bar.button.setFocus()
+        elif bar.isVisible():
+            bar.hide()
+
+    def _confirm_removal(self) -> None:
+        if self._awaiting_confirm and not self.is_busy:
+            self.start_removal()
+
     # -------------------------------------------------------------- opening
     def open_dialog(self) -> None:
         if self.is_busy or not self._confirm_discard():
@@ -560,7 +685,7 @@ class MainWindow(QMainWindow):
             self.open_path(path, confirmed=True)
 
     def open_path(self, path: str | os.PathLike, confirmed: bool = False) -> None:
-        """Load an image and start the automatic removal on it."""
+        """Load an image and show it; the removal waits for Remove Background."""
         path = Path(path)
         if self.is_busy:
             return
@@ -581,7 +706,7 @@ class MainWindow(QMainWindow):
         self._pop_busy()
         self._last_save_path = None
         self.doc.set_image(image)
-        self.start_removal()
+        self.statusBar().showMessage("Check the image, pick Person or Anime, then press Remove Background.", 8000)
 
     def _on_load_failed(self, exc: BaseException) -> None:
         self._pop_busy()
@@ -604,7 +729,8 @@ class MainWindow(QMainWindow):
     def set_subject(self, subject: Subject, rerun: bool = True) -> None:
         self.subject_buttons[Subject(subject)].setChecked(True)
         self.settings.setValue("subject", Subject(subject).value)
-        if rerun and self.doc.has_image and not self.is_busy:
+        # Before the first cutout, switching only picks the model the button will use.
+        if rerun and self.doc.has_alpha and not self.is_busy:
             self.start_removal()
 
     def _on_subject_clicked(self, _button) -> None:
@@ -617,19 +743,130 @@ class MainWindow(QMainWindow):
         self._generation += 1
         gen = self._generation
         subject = self.subject
+        head = self.head_only
+        engine = self.engine
+
+        def work():
+            result = engine.remove_background(image, subject)
+            if not head:
+                return result, None
+            try:
+                return result, engine.head_only(image, result.alpha, subject)
+            except NoFaceFound:
+                return result, None
+
         self._push_busy("Removing background…")
         self.run_in_background(
-            self.engine.remove_background, image, subject,
-            on_done=lambda r: self._on_removed(gen, image, r),
+            work,
+            on_done=lambda r: self._on_removed(gen, image, *r, head_wanted=head),
             on_error=lambda e: self._on_remove_failed(gen, subject, e),
         )
 
-    def _on_removed(self, gen: int, image: LoadedImage, result: CutoutResult) -> None:
+    def _on_removed(self, gen: int, image: LoadedImage, result: CutoutResult,
+                    cut: HeadCut | None = None, head_wanted: bool = False) -> None:
         self._pop_busy()
         if gen != self._generation or image is not self.doc.image:
             return  # superseded by another open / run
+        self._full_alpha = None
+        if cut is not None:
+            self._full_alpha = result.alpha  # the whole cutout, for switching Head only off
+            result.alpha = cut.alpha
         self.doc.set_auto_result(result)
+        if result.notice:
+            self.statusBar().showMessage(result.notice, 15000)
+        if head_wanted and cut is None:
+            self._no_face_found()
         self.cutout_ready.emit()
+
+    # ------------------------------------------------------------ head only
+    @property
+    def head_only(self) -> bool:
+        return self.act_head.isChecked()
+
+    def set_head_only(self, on: bool) -> None:
+        """Like clicking Head Only: before a cutout it picks the mode, after one it applies it."""
+        if self.act_head.isChecked() != bool(on):
+            self.act_head.setChecked(bool(on))
+            self._on_head_triggered(bool(on))
+
+    def _on_head_mode_changed(self, on: bool) -> None:
+        self.settings.setValue("head_only", bool(on))
+        box = self.confirm_bar.head_only
+        if box.isChecked() != on:
+            box.blockSignals(True)
+            box.setChecked(on)
+            box.blockSignals(False)
+
+    def _show_head_checked(self, on: bool) -> None:
+        """Show the switch on or off without applying anything or changing the saved choice."""
+        self.act_head.blockSignals(True)
+        self.act_head.setChecked(on)
+        self.act_head.blockSignals(False)
+        box = self.confirm_bar.head_only
+        box.blockSignals(True)
+        box.setChecked(on)
+        box.blockSignals(False)
+
+    def _on_head_triggered(self, on: bool) -> None:
+        if not self.doc.has_alpha or self.is_busy:
+            return  # no cutout yet: it only picks what Remove Background makes
+        if on:
+            self._cut_head()
+        elif self._full_alpha is not None:
+            full, self._full_alpha = self._full_alpha, None
+            self.doc.replace_alpha(full, "Whole cutout")
+            self._prepare_save_in_background()
+            self.statusBar().showMessage("Showing the whole cutout again.", 4000)
+
+    def mark_face(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        """Keep only the head of the face the user boxed (the Mark Face tool)."""
+        if not self.doc.has_alpha or self.is_busy:
+            return
+        self._cut_head([Face.from_box(x0, y0, x1, y1)], source=self._full_alpha)
+
+    def _cut_head(self, faces: list[Face] | None = None, source: np.ndarray | None = None) -> None:
+        image = self.doc.image
+        source = self.doc.snapshot_alpha() if source is None else source
+        subject = self.subject
+        self._push_busy("Finding the head…")
+
+        def done(cut: HeadCut) -> None:
+            self._pop_busy()
+            if image is not self.doc.image or not self.doc.has_alpha:
+                return
+            self._full_alpha = source
+            self.doc.replace_alpha(cut.alpha, "Head only")
+            self._show_head_checked(True)
+            self._prepare_save_in_background()
+            n = len(cut.faces)
+            self.statusBar().showMessage(
+                "Kept the head." if n == 1 else f"Kept {n} heads.", 6000)
+
+        def failed(exc: BaseException) -> None:
+            self._pop_busy()
+            if isinstance(exc, NoFaceFound):
+                if image is self.doc.image:
+                    self._no_face_found()
+            else:
+                self._show_head_checked(self._full_alpha is not None)
+                self._report_error("Head only failed", exc)
+
+        self.run_in_background(self.engine.head_only, image, source, subject, faces,
+                               on_done=done, on_error=failed)
+
+    def _no_face_found(self) -> None:
+        """Keep the whole cutout and let the user box the face instead."""
+        self._show_head_checked(False)
+        self.activate_tool(self.head_tool.id)
+        self.statusBar().showMessage("No face found: drag a box over the face, from the forehead to the chin.", 20000)
+        log.info("head only: no face found; asking the user to mark it")
+        self.head_not_found.emit()
+        if self.ask_user:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("Head only")
+            box.setText(NO_FACE_TEXT)
+            box.open()  # not modal-blocking: the user goes straight on to drawing the box
 
     def _on_remove_failed(self, gen: int, subject: Subject, exc: BaseException) -> None:
         self._pop_busy()
@@ -643,16 +880,16 @@ class MainWindow(QMainWindow):
                 f"Models folder:\n{self.engine.models_dir}\n\n"
                 "Reinstall Cutout, or copy the model files into that folder.",
             )
+        elif isinstance(exc, GpuOutOfMemory):
+            self._report_error("Out of memory", exc)
         else:
             self._report_error("Background removal failed", exc)
 
     def warmup_in_background(self) -> None:
-        """Load the model for the current subject while the user picks a file."""
-        def warm(subject=self.subject):
-            try:
-                self.engine.warmup(subject)
-            except ModelNotInstalled:
-                pass  # reported when the user actually runs a removal
+        """Load and warm the current subject's model (then the other one, if both fit) while
+        the user picks a file. A cutout started meanwhile waits for it and then runs warm."""
+        def warm(subject=self.subject, report=self.warmup_tracker.report):
+            self.engine.warmup_all(subject, progress=report)  # skips subjects with no model
         self.run_in_background(warm, on_error=lambda e: log.warning("warmup failed: %s", e))
 
     # --------------------------------------------------------------- saving
@@ -682,13 +919,34 @@ class MainWindow(QMainWindow):
                 "Saving over the original image would destroy it. Pick a different file name."))
             return
         image = self.doc.image
-        alpha = self.doc.snapshot_alpha()
         decon = self.doc.result.decontaminate if self.doc.result is not None else True
         undo_index = self.doc.undo_stack.index()
+        ready = self._prepared_save(image, decon)
+        alpha = self.doc.snapshot_alpha()  # the fallback if the prepared save failed
+        prep = self.doc.result.prep if self.doc.result is not None else None
         self._push_busy(f"Saving {path.name}…")
 
         def work():
-            save_png(path, compose_rgba(image, alpha, decon), image.icc_profile)
+            t = time.perf_counter()
+            payload = None
+            if ready is not None:
+                try:
+                    payload = ready.result()  # usually finished already; waits if not
+                except Exception as exc:  # noqa: BLE001 - fall back to a fresh encode
+                    log.warning("prepared save failed, encoding again: %s", exc)
+            fresh = payload is None
+            if payload is None:
+                rgba = compose_rgba(image, alpha, decon, prep)
+                payload = encode_rgba_png(rgba, image.icc_profile)
+                del rgba
+            t_write = time.perf_counter()
+            write_png_bytes(path, payload)
+            steps = {"compose+encode" if fresh else "wait for prepared PNG": t_write - t,
+                     "write": time.perf_counter() - t_write}
+            debug.record_timings(f"save {image.width}x{image.height}", steps,
+                                 prepared_in_background=not fresh, size=f"{len(payload) / 1e6:.1f} MB")
+            log.info("saved %s in %.2fs (%s)", path.name, time.perf_counter() - t,
+                     "composed on save" if fresh else "prepared in the background")
             return path
 
         def done(p: Path):
@@ -705,6 +963,36 @@ class MainWindow(QMainWindow):
             self._report_error("Couldn't save the PNG", exc)
 
         self.run_in_background(work, on_done=done, on_error=failed)
+
+    def _prepare_save_in_background(self) -> None:
+        """Compose and encode the PNG on the CPU as soon as a cutout is shown, so Save only
+        has to write the file. Thrown away if the matte changes before the user saves."""
+        doc = self.doc
+        if doc.image is None or doc.alpha is None:
+            self._save_prep = None
+            return
+        image, alpha = doc.image, doc.snapshot_alpha()
+        decon = doc.result.decontaminate if doc.result is not None else True
+        prep = doc.result.prep if doc.result is not None else None
+
+        def work():
+            t = time.perf_counter()
+            payload = encode_rgba_png(compose_rgba(image, alpha, decon, prep), image.icc_profile)
+            debug.record_timings(f"save prepared in background {image.width}x{image.height}",
+                                 {"compose+encode": time.perf_counter() - t}, size=f"{len(payload) / 1e6:.1f} MB")
+            return payload
+
+        self._save_prep = (image, doc.revision, decon, parallel.submit(work))
+
+    def _prepared_save(self, image: LoadedImage, decon: bool):
+        """The background-prepared PNG future for the matte as it is now, or ``None``."""
+        sp = self._save_prep
+        if sp is None:
+            return None
+        p_image, p_rev, p_decon, future = sp
+        if p_image is image and p_rev == self.doc.revision and p_decon == decon and not future.cancelled():
+            return future
+        return None
 
     # ---------------------------------------------------------------- view
     def set_backdrop(self, backdrop: Backdrop) -> None:
@@ -724,8 +1012,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------- status / title
     def _on_image_changed(self) -> None:
         img = self.doc.image
+        self._save_prep = None  # the old image's prepared PNG is no use any more
+        self._full_alpha = None
+        self._show_head_checked(bool(self.settings.value("head_only", False, type=bool)))
         self.act_original.setChecked(False)
         self.canvas.set_show_original(False)
+        self.warmup_tracker.changed.emit()  # the loading bar moves between screen and status bar
         if img is None:
             self.stack.setCurrentWidget(self.empty)
             self.lbl_file.clear()
@@ -747,6 +1039,7 @@ class MainWindow(QMainWindow):
         if r is None:
             self.lbl_model.clear()
             return
+        self._prepare_save_in_background()
         spec = REGISTRY.get(r.model_id)
         name = spec.id if spec else r.model_id
         device = r.device.upper()
@@ -840,7 +1133,7 @@ class MainWindow(QMainWindow):
         self.task_failed.emit(f"{title}: {message}")
         self.statusBar().showMessage(title, 6000)
         if self.ask_user:
-            QMessageBox.warning(self, title, message)
+            debug_menu.show_error(self, title, message, exc)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.is_busy and self.ask_user:
@@ -861,6 +1154,7 @@ class MainWindow(QMainWindow):
             self.set_subject(Subject(self.settings.value("subject", Subject.PERSON.value)), rerun=False)
         except ValueError:
             pass
+        self._show_head_checked(bool(self.settings.value("head_only", False, type=bool)))
         try:
             self.set_backdrop(Backdrop(self.settings.value("backdrop", Backdrop.CHECKER.value)))
         except ValueError:
@@ -870,3 +1164,5 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if self.overlay.isVisible():
             self.overlay.setGeometry(self.stack.rect())
+        if self.confirm_bar.isVisible():
+            self.confirm_bar.place()

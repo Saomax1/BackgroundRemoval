@@ -46,7 +46,7 @@ import cv2
 import numpy as np
 
 from .models import PromptModelSpec
-from .runtime import SessionInfo, create_session
+from .runtime import SessionInfo, create_session, run_options
 
 
 @dataclass
@@ -110,6 +110,7 @@ class OnnxSamSegmenter:
         self._enc_outputs = [o.name for o in self.encoder.get_outputs()]
         self._dec_inputs = {i.name: _np_dtype(i.type) for i in self.decoder.get_inputs()}
         self._dec_outputs = [o.name for o in self.decoder.get_outputs()]
+        self._enc_run_opts = run_options(self.info)  # free the encoder's activations after each image
 
     @property
     def name(self) -> str:
@@ -128,7 +129,7 @@ class OnnxSamSegmenter:
         x = cv2.resize(rgb, (s, s), interpolation=interp).astype(np.float32) / 255.0
         x = (x - np.asarray(self.spec.mean, np.float32)) / np.asarray(self.spec.std, np.float32)
         tensor = np.ascontiguousarray(x.transpose(2, 0, 1)[None]).astype(self._enc_dtype)
-        outs = self.encoder.run(None, {self._enc_input: tensor})
+        outs = self.encoder.run(None, {self._enc_input: tensor}, self._enc_run_opts)
         return ImageEmbedding(height=h, width=w, features=dict(zip(self._enc_outputs, outs)))
 
     def decode(self, embedding, points, labels, box=None, mask_input=None) -> PromptPrediction:

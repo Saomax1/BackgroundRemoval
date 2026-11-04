@@ -6,11 +6,14 @@ your NVIDIA graphics card to go fast, and never shrinks your picture: what comes
 out is exactly the same size as what went in.
 
 **Where things stand:** the background-removal engine works from a command
-window today. The point-and-click app and the touch-up brush are being built
-next. A one-click `Setup.exe` that installs everything (models included) is
-built automatically on GitHub; see [packaging/README.md](packaging/README.md)
-for where to download it. Until you have that, use the steps below. You only
-do them once.
+window and in the editor window, which also has touch-up brushes and
+click-to-select. A one-click `Setup.exe` is built automatically on GitHub: download it
+from the [latest release](https://github.com/Saomax1/BackgroundRemoval/releases/latest)
+(no sign-in needed). The first time Cutout starts it downloads its AI models
+(about 3 GB, once). To update later, choose **Help > Check for Updates** in the
+app: it downloads only what changed, usually a few tens of MB, and restarts.
+Your settings are kept. Details are in [packaging/README.md](packaging/README.md).
+If you'd rather run from source, use the steps below. You only do them once.
 
 ---
 
@@ -127,6 +130,21 @@ and press **O** to compare with the original. **Save PNG** writes a
 transparent PNG at the exact size of your picture, next to it as
 `name_cutout.png` by default.
 
+To fix anything the automatic step missed, pick a tool on the left:
+
+| Tool | Key | What it does |
+|---|---|---|
+| **Keep** | K | Paint back parts of the subject that were removed. |
+| **Erase** | E | Paint away leftover background. Hold **Alt** to switch between Keep and Erase. |
+| **Refine Edge** | R | Brush over hair or fur so the edge follows the photo. |
+| **Select** | S | Click a whole part (a sleeve, a gap between arms). Right-click excludes. **Enter** keeps the blue area, **Delete** removes it, **Esc** clears. |
+
+The brush size is in pixels of your full-size picture, from **1 px** (exactly
+one pixel, no feathering) up to 1000 px. Change it with the Size slider, the
+number box, the **1 px** button, `[` and `]`, or Ctrl+scroll. Zoom in (scroll,
+up to 6400%) to work on single pixels; from 800% a grid shows every pixel.
+**Ctrl+Z** undoes each stroke or selection.
+
 ## Removing a background from the command line
 
 ```powershell
@@ -143,6 +161,16 @@ paste its full path instead of typing it.
 ---
 
 ## If something goes wrong
+
+**Sending a problem report.** Turn on **Help > Debug Mode** (it stays on until
+you turn it off), or start Cutout from the **Cutout (debug mode)** Start menu
+shortcut. Do the thing that failed again, then choose **Help > Copy Debug
+Report** and paste it into the chat. Error messages also have a **Copy Report**
+button, and if Cutout closed unexpectedly it offers a report the next time it
+starts. The report holds your PC and graphics card details, which model ran,
+memory use, and the recent log. Your user folder name is replaced with
+`%USERPROFILE%`. Log files are kept in `%LOCALAPPDATA%\Cutout\logs`
+(**Help > Open Log Folder**).
 
 **"running ... on CPU (this will be slow)" or `device=cpu`**
 Cutout couldn't use your graphics card. It still works, just slower. To fix it:
@@ -173,8 +201,13 @@ sure "Add Python to environment variables" is ticked. Then reopen PowerShell.
 Install the Microsoft Visual C++ Redistributable (x64) from
 <https://aka.ms/vs/17/release/vc_redist.x64.exe>, then restart PowerShell.
 
-**"out of memory" errors on very large photos**
-The top people model needs a fair amount of graphics memory. Use the smaller one:
+**"out of memory" errors**
+Cutout keeps one model on the graphics card at a time and unloads it when you
+switch between Person and Anime. If the card still runs out (other programs, such
+as games or video editors, are using it), Cutout retries once and then makes that
+cutout on the processor instead, which is slower but gives the same result. The
+photo's size doesn't matter: the models always run at a fixed size. If it keeps
+happening, the smaller people model needs much less graphics memory:
 `python -m cutout photo.jpg --model birefnet-general`
 
 **"no person model installed" (or "no anime model installed")**

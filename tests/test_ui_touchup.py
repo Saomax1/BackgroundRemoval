@@ -70,6 +70,8 @@ def open_photo(window, tmp_path, h=600, w=800):
     p = tmp_path / "photo.png"
     Image.fromarray(rgb).save(p)
     window.open_path(p)
+    wait_until(lambda: window.doc.has_image and not window.is_busy)
+    window.confirm_bar.button.click()  # "Remove Background"
     wait_until(lambda: window.doc.has_alpha and not window.is_busy)
     window.canvas.actual_pixels()
     window.canvas.centerOn(w / 2, h / 2)
@@ -77,7 +79,8 @@ def open_photo(window, tmp_path, h=600, w=800):
 
 
 def mouse(window, kind, x, y, button=LEFT, buttons=None, mods=NO):
-    view = QPointF(window.canvas.mapFromScene(QPointF(x, y)))
+    # Exact float view position of the image point, minus the half-pixel the canvas adds back.
+    view = window.canvas.viewportTransform().map(QPointF(x, y)) - QPointF(0.5, 0.5)
     types = {"press": QEvent.Type.MouseButtonPress, "move": QEvent.Type.MouseMove,
              "release": QEvent.Type.MouseButtonRelease}
     if buttons is None:
@@ -149,16 +152,77 @@ def test_alt_swaps_keep_and_erase(window, tmp_path):
     assert window.doc.alpha[300, 401] == pytest.approx(0.0)
 
 
-def test_brush_size_is_screen_relative(window, tmp_path):
+def test_brush_size_is_in_image_pixels_and_adjustable(window, tmp_path):
     open_photo(window, tmp_path)
     window.activate_tool("brush-erase")
     tool = window.active_tool
     window.brush_settings.size = 40
     assert tool.image_radius() == pytest.approx(20.0)
     window.act_zoom_in.trigger()
-    assert tool.image_radius() < 20.0
+    assert tool.image_radius() == pytest.approx(20.0)  # zoom does not change what it paints
     key(window, Qt.Key.Key_BracketRight)
     assert window.brush_settings.size > 40
+    window.brush_settings.size = 3
+    key(window, Qt.Key.Key_BracketLeft)
+    key(window, Qt.Key.Key_BracketLeft)
+    assert window.brush_settings.size == 1
+    key(window, Qt.Key.Key_BracketLeft)
+    assert window.brush_settings.size == 1  # never below one pixel
+    opts = tool.options_widget()
+    opts.size_box.setValue(250)
+    assert window.brush_settings.size == 250
+    opts.one_px.click()
+    assert window.brush_settings.size == 1 and opts.size_box.value() == 1
+    opts.size_slider.setValue(opts.size_slider.maximum())
+    assert window.brush_settings.size == 1000
+
+
+@pytest.mark.parametrize("tool_id,start,target", [("brush-erase", 1.0, 0.0), ("brush-keep", 0.0, 1.0)])
+def test_one_pixel_brush_changes_exactly_one_pixel(window, tmp_path, tool_id, start, target):
+    open_photo(window, tmp_path)
+    window.brush_settings.size = 1
+    window.activate_tool(tool_id)
+    x, y = (400, 300) if start == 1.0 else (50, 50)
+    assert window.doc.alpha[y, x] == pytest.approx(start)
+    before = window.doc.alpha.copy()
+    stroke(window, [(x + 0.3, y + 0.8)])  # anywhere inside the pixel
+    changed = np.argwhere(window.doc.alpha != before)
+    assert changed.tolist() == [[y, x]]
+    assert window.doc.alpha[y, x] == target  # fully, not feathered
+    window.act_undo.trigger()
+    assert np.array_equal(window.doc.alpha, before)
+
+
+def test_small_brushes_paint_whole_pixels(window, tmp_path):
+    open_photo(window, tmp_path)
+    window.activate_tool("brush-erase")
+    for size, count in ((2, 4), (3, 9)):
+        window.brush_settings.size = size
+        before = window.doc.alpha.copy()
+        stroke(window, [(400.2, 300.2)])
+        diff = window.doc.alpha != before
+        assert diff.sum() == count
+        assert np.all(window.doc.alpha[diff] == 0.0)
+        window.act_undo.trigger()
+
+
+def test_one_pixel_stroke_draws_a_connected_line(window, tmp_path):
+    open_photo(window, tmp_path)
+    window.brush_settings.size = 1
+    window.activate_tool("brush-erase")
+    before = window.doc.alpha.copy()
+    stroke(window, [(380.5, 300.5), (390.5, 300.5), (400.5, 300.5)])
+    row = window.doc.alpha[300, 380:401]
+    assert np.all(row == 0.0)
+    assert np.array_equal(window.doc.alpha[299], before[299]) and np.array_equal(window.doc.alpha[301], before[301])
+
+
+def test_zoom_reaches_pixel_level(window, tmp_path):
+    open_photo(window, tmp_path)
+    for _ in range(40):
+        window.act_zoom_in.trigger()
+    assert window.canvas.zoom >= 32
+    window.canvas.grab()  # draws the pixel grid without errors
 
 
 def test_escape_cancels_stroke(window, tmp_path):

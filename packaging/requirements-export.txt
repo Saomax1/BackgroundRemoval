@@ -1,5 +1,5 @@
 # Build-machine only: turns PyTorch-only checkpoints into ONNX (scripts/export_birefnet_onnx.py).
-# Pinned to a TorchScript-exporter era torch so deform_conv2d_onnx_exporter keeps working.
+# torch pinned so the TorchScript (dynamo=False) exporter behaves the same on every build.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.5.1
 torchvision==0.20.1
@@ -8,5 +8,4 @@ huggingface_hub>=0.25
 timm>=1.0
 kornia>=0.7
 einops>=0.8
-deform_conv2d_onnx_exporter>=1.2
 onnx>=1.16

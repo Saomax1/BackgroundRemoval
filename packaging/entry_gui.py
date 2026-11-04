@@ -29,9 +29,21 @@ def run() -> int:
     try:
         return int(main(sys.argv[1:]) or 0)
     except Exception:
+        import logging
         import traceback
 
-        _message("Cutout hit an unexpected error:\n\n" + traceback.format_exc()[-1500:])
+        trace = traceback.format_exc()
+        logging.getLogger("cutout.crash").critical("fatal error:\n%s", trace)
+        where = ""
+        try:
+            from cutout.core import debug
+
+            report = debug.save_report(extra="Fatal error:\n" + trace)
+            where = (f"\n\nA debug report was saved to:\n{report}\n\n"
+                     "Paste that report into the chat so the problem can be fixed.")
+        except Exception:
+            pass
+        _message("Cutout hit an unexpected error:\n\n" + trace[-1500:] + where)
         return 1
 
 
