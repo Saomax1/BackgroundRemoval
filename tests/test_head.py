@@ -80,11 +80,11 @@ def test_raised_arm_touching_hair_is_dropped():
 def test_hair_and_hat_sticking_out_are_kept():
     a, face = person()
     a[60:170, 290:310] = 1  # a tall hat / bun on top of the head
-    a[150:300, 150:220] = 1  # big hair at the side, above the chin
-    a[150:200, 210:230] = 1  # joined to the head
+    a[120:300, 120:230] = 1  # big hair at the side (thicker than an arm), above the chin
     out = keep_head(a, [face]).alpha
     assert out[70, 300] == 1.0
     assert out[200, 160] == 1.0
+    assert out[280, 140] == 0.0  # but below the eyes it stops ~0.8 face widths out
 
 
 def test_tilted_head_cut_follows_the_tilt():
@@ -190,3 +190,13 @@ def test_engine_head_only_uses_cpu_and_records_timing(tmp_path):
     assert cut.alpha[700, 300] == 0.0 and cut.alpha[250, 300] == 1.0
     assert engine.loaded_models == []  # no model was loaded for this
     assert any("head only" in line for line in debug.recent_timings())
+
+
+def test_shoulder_pushed_up_beside_the_face_is_trimmed():
+    # A selfie: the shoulder rises above chin level beside the face.
+    a, face = person()
+    a[230:330, 100:250] = 1  # jacket/shoulder next to the cheek, joined to the head
+    out = keep_head(a, [face]).alpha
+    assert out[300, 160] == 0.0  # more than ~0.8 face widths out, below the eyes
+    assert out[250, 300] == 1.0
+    assert out[300, 240] == 1.0  # close beside the cheek (where hair hangs) is kept

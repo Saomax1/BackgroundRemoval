@@ -94,6 +94,12 @@ class HeadOptions:
     # Half-width of the neck, in face widths, and how gradually the cut rises beside it.
     neck_half_width: float = 0.32
     shoulder_blend: float = 0.3
+    # Below eye level nothing further than ``cheek_reach`` face widths from the middle of
+    # the face is kept (hair hanging beside the face fits; shoulders pushed up beside the
+    # head in a selfie, collars and hoods don't). The limit eases in from ``cheek_start``
+    # face heights above the face centre (about eye level), so hair above is untouched.
+    cheek_reach: float = 0.9
+    cheek_start: float = 0.15
     # Softness of the cut, as a fraction of the face height (at least 1.5 px).
     feather: float = 0.03
     # How far from the face hair may reach, in face heights: sideways and upwards.
@@ -260,6 +266,7 @@ def _head_roi(alpha: np.ndarray, face: Face, o: HeadOptions):
     n0, n1 = o.neck_half_width * fw, (o.neck_half_width + o.shoulder_blend) * fw
     cut = max(cut_mid, cut_side)
     feather = max(1.5, o.feather * fh)
+    cheek, cheek_top = o.cheek_reach * fw, o.cheek_start * fh
     side, up, low = o.reach_side * fh, o.reach_up * fh, cut + feather
 
     # Axis-aligned box around the (possibly tilted) search area.
@@ -288,12 +295,18 @@ def _head_roi(alpha: np.ndarray, face: Face, o: HeadOptions):
         t = np.clip((np.abs(along) - n0) / max(n1 - n0, 1e-6), 0.0, 1.0)
         depth = cut_side + (cut_mid - cut_side) * (0.5 + 0.5 * np.cos(np.pi * t))
         r = np.clip(0.5 - (down - depth) / feather, 0.0, 1.0)
+        # Sideways limit below the eyes: widens smoothly to no limit higher up.
+        lift = np.clip((down + cheek_top) / max(cheek_top, 1e-6), 0.0, 1.0)  # 0 above, 1 from centre down
+        reach = cheek + (side - cheek) * (1.0 - lift)
+        r = np.minimum(r, np.clip(0.5 - (np.abs(along) - reach) / feather, 0.0, 1.0))
         ramp[y0:y1] = r
         inside = (np.abs(along) <= side) & (down >= -up) & (r > 0)
         binary[y0:y1] = inside & (a[y0:y1] > o.min_alpha)
         vert = np.where(down < 0, cu, cut)
         outside = (along / cs) ** 2 + (down / vert) ** 2 > 1.0
-        shoulder = (down >= depth - band) & (np.abs(along) > n0)
+        # Where the body is cut off: the shoulder line, and the sideways limit below the eyes.
+        shoulder = ((down >= depth - band) & (np.abs(along) > n0)) | (
+            (lift > 0) & (np.abs(along) >= reach - band))
         far_up = (down < 0) & (along * along + down * down > reach2)
         zone[y0:y1] = outside * (1 + 2 * shoulder + 4 * far_up).astype(np.uint8)
 
