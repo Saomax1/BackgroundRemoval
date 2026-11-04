@@ -105,6 +105,14 @@ class CutoutDocument(QObject):
         self.result_changed.emit()
 
     # ------------------------------------------------------------- editing
+    def replace_alpha(self, alpha: np.ndarray, text: str) -> None:
+        """Swap in a whole new matte (e.g. Head only) as one undo step."""
+        if self.alpha is None or self.image is None:
+            raise RuntimeError("no matte to replace yet")
+        if alpha.shape != self.alpha.shape:
+            raise ValueError(f"matte {alpha.shape} does not match the image {self.alpha.shape}")
+        self.undo_stack.push(_ReplaceAlphaCommand(self, np.ascontiguousarray(alpha, dtype=np.float32), text))
+
     def notify_alpha_changed(self, rect: QRect) -> None:
         """Tell views that ``rect`` of ``alpha`` was edited in place (no undo entry)."""
         rect = rect.intersected(self.full_rect())

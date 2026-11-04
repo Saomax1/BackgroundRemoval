@@ -17,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .core.engine import CutoutEngine
+from .core.head import NoFaceFound
 from .core.models import (
     PROMPT_REGISTRY,
     REGISTRY,
@@ -37,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", choices=sorted(REGISTRY), help="force a specific model")
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     p.add_argument("--models-dir", type=Path, default=None)
+    p.add_argument("--head", action="store_true", help="keep only the head (face and hair), cut at the neck")
     p.add_argument("--no-refine", action="store_true", help="skip guided edge refinement")
     p.add_argument("--no-decontaminate", action="store_true", help="skip edge colour cleanup")
     p.add_argument("--list-models", action="store_true", help="show known and installed models")
@@ -87,12 +89,19 @@ def main(argv: list[str] | None = None) -> int:
     engine = CutoutEngine(models_dir=models_dir, device=args.device, refine=opts)
     try:
         result = engine.remove_background(args.input, Subject(args.subject), args.model)
+        if args.head:
+            t = time.perf_counter()
+            result.alpha = engine.head_only(result.image, result.alpha, Subject(args.subject)).alpha
+            result.timings["head only"] = time.perf_counter() - t
         t = time.perf_counter()
         result.save_png(output)
         result.timings["compose+save"] = time.perf_counter() - t
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except NoFaceFound:
+        print("error: no face found, so the head can't be cut out", file=sys.stderr)
+        return 3
 
     timing = ", ".join(f"{k} {v:.2f}s" for k, v in result.timings.items())
     print(

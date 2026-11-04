@@ -360,3 +360,99 @@ def test_status_bar_loading_bar_only_shows_with_an_image_open(window, tmp_path):
     assert window.warmup_status.isVisible() and not window.warmup_panel.isVisible()
     t.on_stage("done", "")
     assert not window.warmup_status.isVisible()
+
+
+# ------------------------------------------------------------------- head only
+# The fake segmenter's cutout is a disc centred at (201.5, 300.5), radius ~141. A face
+# box in its upper half puts the cut (a little below the chin, y ~ 308) through it.
+HEAD_FACE = (160.0, 200.0, 80.0, 90.0)
+
+
+def _fake_faces(window, monkeypatch, faces):
+    from cutout.core.head import Face
+
+    found = [Face(*f) for f in faces]
+    monkeypatch.setattr(window.engine.face_finder, "find", lambda rgb, alpha=None, subject=None: list(found))
+
+
+def test_head_only_ticked_before_remove_background(window, tmp_path, monkeypatch):
+    _fake_faces(window, monkeypatch, [HEAD_FACE])
+    window.open_path(_photo(tmp_path))
+    wait_until(lambda: window.doc.has_image and not window.is_busy)
+    assert window.confirm_bar.head_only.isVisible() and not window.act_head.isChecked()
+    window.confirm_bar.head_only.click()
+    assert window.act_head.isChecked() and window.settings.value("head_only", type=bool)
+    window.confirm_bar.button.click()
+    wait_until(lambda: window.doc.has_alpha and not window.is_busy)
+    a = window.doc.alpha
+    assert a.shape == (601, 403)  # full size, never cropped
+    assert a[250, 201] == 1.0  # face
+    assert a[420, 201] == 0.0  # body (inside the disc, below the neck)
+    assert window.act_head.isChecked()
+
+    # Switching Head only off puts the whole cutout back without running the model.
+    calls = []
+    real = window.engine.remove_background
+    window.engine.remove_background = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    window.act_head.trigger()
+    assert not window.is_busy and calls == []
+    assert window.doc.alpha[420, 201] == 1.0
+    window.act_undo.trigger()  # and that is undoable
+    assert window.doc.alpha[420, 201] == 0.0
+
+
+def test_head_only_switched_on_after_a_cutout_is_undoable(window, tmp_path, monkeypatch):
+    _fake_faces(window, monkeypatch, [HEAD_FACE])
+    _open(window, _photo(tmp_path))
+    assert window.doc.alpha[420, 201] == 1.0
+    window.act_head.trigger()
+    wait_until(lambda: not window.is_busy)
+    assert window.doc.alpha[420, 201] == 0.0 and window.doc.alpha[250, 201] == 1.0
+    assert window.doc.undo_stack.undoText() == "Head only"
+    window.act_undo.trigger()
+    assert window.doc.alpha[420, 201] == 1.0
+
+
+def test_no_face_keeps_cutout_and_offers_mark_face(window, tmp_path, monkeypatch):
+    _fake_faces(window, monkeypatch, [])
+    misses = []
+    window.head_not_found.connect(lambda: misses.append(1))
+    window.confirm_bar.head_only.click()
+    _open(window, _photo(tmp_path))
+    assert window.doc.alpha[420, 201] == 1.0  # the whole cutout is kept
+    assert not window.act_head.isChecked()  # it isn't a head cut
+    assert window.settings.value("head_only", type=bool)  # but the choice for next time stays
+    assert window.active_tool is window.head_tool
+    assert misses == [1]
+
+    # The user boxes the face with the Mark Face tool.
+    window.mark_face(240.0, 290.0, 160.0, 200.0)  # any corner order
+    wait_until(lambda: not window.is_busy)
+    assert window.doc.alpha[420, 201] == 0.0 and window.doc.alpha[250, 201] == 1.0
+    assert window.act_head.isChecked()
+
+    # Boxing again re-cuts from the whole cutout, not from the head cut.
+    window.mark_face(160.0, 330.0, 240.0, 420.0)  # lower: more of the disc is kept
+    wait_until(lambda: not window.is_busy)
+    assert window.doc.alpha[420, 201] == 1.0 and window.doc.alpha[180, 201] == 1.0
+
+
+def test_mark_face_tool_drag_draws_box_and_cuts(window, tmp_path, monkeypatch):
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    _open(window, _photo(tmp_path))
+    window.activate_tool("mark_face")
+    tool = window.head_tool
+
+    def ev(kind, pos, buttons):
+        return QMouseEvent(kind, QPointF(0, 0), QPointF(0, 0), Qt.MouseButton.LeftButton, buttons,
+                           Qt.KeyboardModifier.NoModifier)
+
+    assert tool.mouse_press(QPointF(160, 200), ev(QEvent.Type.MouseButtonPress, None, Qt.MouseButton.LeftButton))
+    tool.mouse_move(QPointF(240, 290), ev(QEvent.Type.MouseMove, None, Qt.MouseButton.LeftButton))
+    assert tool._item is not None and tool._item.rect().width() == 80
+    tool.mouse_release(QPointF(240, 290), ev(QEvent.Type.MouseButtonRelease, None, Qt.MouseButton.NoButton))
+    assert tool._item is None
+    wait_until(lambda: not window.is_busy)
+    assert window.doc.alpha[420, 201] == 0.0 and window.doc.alpha[250, 201] == 1.0
