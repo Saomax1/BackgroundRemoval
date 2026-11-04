@@ -149,3 +149,26 @@ def test_editor_rejects_bad_alpha():
         MatteEditor(np.zeros((10, 10), np.float64))
     with pytest.raises(ValueError):
         MatteEditor(np.zeros((10, 10), np.float32), LoadedImage(np.zeros((5, 5, 3), np.uint8)))
+
+
+def test_pixel_exact_stamp_snaps_to_grid():
+    from cutout.editing.brush import dab_rect, is_pixel_exact, pixel_stamp, snap_centre
+
+    assert is_pixel_exact(0.5) and is_pixel_exact(2.0) and not is_pixel_exact(2.5)
+    cx, cy = snap_centre(10.9, 4.1, 0.5)
+    assert (cx, cy) == (10.5, 4.5)
+    r = dab_rect(cx, cy, 0.5)
+    assert (r.x, r.y, r.w, r.h) == (10, 4, 1, 1)
+    assert pixel_stamp(cx, cy, 0.5, r).tolist() == [[1.0]]
+    cx, cy = snap_centre(10.4, 4.6, 1.0)  # even diameter: on a pixel corner
+    r = dab_rect(cx, cy, 1.0)
+    assert (r.w, r.h) == (2, 2) and pixel_stamp(cx, cy, 1.0, r).sum() == 4
+
+
+def test_one_pixel_brush_in_editor():
+    alpha = np.zeros((20, 20), np.float32)
+    ed = MatteEditor(alpha)
+    ed.begin_stroke(5.7, 6.2, Brush(BrushMode.KEEP, radius=0.5))
+    patch = ed.end_stroke()
+    assert np.argwhere(alpha).tolist() == [[6, 5]] and alpha[6, 5] == 1.0
+    assert patch is not None

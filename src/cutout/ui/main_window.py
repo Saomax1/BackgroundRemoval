@@ -249,6 +249,7 @@ class MainWindow(QMainWindow):
         engine: CutoutEngine | None = None,
         settings: QSettings | None = None,
         ask_user: bool = True,
+        touchup_tools: bool = True,
     ):
         super().__init__()
         self.engine = engine or CutoutEngine()
@@ -263,6 +264,7 @@ class MainWindow(QMainWindow):
         self._tool_actions: dict[str, QAction] = {}
         self._active_tool: CanvasTool | None = None
         self._live_tasks: set[Task] = set()
+        self._option_actions: dict[int, QAction] = {}  # id(widget) -> its action in the options bar
         # A save prepared in the background right after a cutout: (image, revision, decon, future).
         self._save_prep: tuple[LoadedImage, int, bool, Any] | None = None
         # The whole cutout from before the last Head only, so Head only can be switched off
@@ -296,6 +298,10 @@ class MainWindow(QMainWindow):
         self.register_tool(PanTool(), shortcut="H")
         self.head_tool = HeadBoxTool(self.mark_face)
         self.register_tool(self.head_tool, shortcut="F")
+        if touchup_tools:
+            from .touchup import install_touchup_tools
+
+            install_touchup_tools(self)
         self.activate_tool("pan")
         self._restore_settings()
         self._sync_actions()
@@ -385,6 +391,16 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
         self.toolbar = tb
 
+        # Second row: settings of the active tool (brush size, selection buttons).
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
+        ob = QToolBar("Tool options")
+        ob.setObjectName("optionsToolbar")
+        ob.setMovable(False)
+        ob.setFloatable(False)
+        ob.setVisible(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, ob)
+        self.options_bar = ob
+
         tb.addAction(self.act_open)
         tb.addSeparator()
 
@@ -414,31 +430,44 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_rerun)
         tb.addSeparator()
 
-        # Tools are inserted before this marker by register_tool().
-        self._tools_marker = tb.addSeparator()
+        # Canvas tools (Move, Mark Face, brushes, Select) live in a column on the left,
+        # so the top row keeps room for the cutout controls and Save.
+        lt = QToolBar("Tools")
+        lt.setObjectName("toolsToolbar")
+        lt.setOrientation(Qt.Orientation.Vertical)
+        lt.setMovable(False)
+        lt.setFloatable(False)
+        lt.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, lt)
+        self.tools_bar = lt
 
-        tb.addAction(self.act_undo)
-        tb.addAction(self.act_redo)
+        # Fixed short labels on the toolbar; the menu items say what will be undone.
+        self.tb_undo = QAction("Undo", self)
+        self.tb_undo.setToolTip("Undo (Ctrl+Z)")
+        self.tb_undo.triggered.connect(self.act_undo.trigger)
+        self.tb_redo = QAction("Redo", self)
+        self.tb_redo.setToolTip("Redo (Ctrl+Y)")
+        self.tb_redo.triggered.connect(self.act_redo.trigger)
+        tb.addAction(self.tb_undo)
+        tb.addAction(self.tb_redo)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
 
         tb.addAction(self.act_original)
+        self.act_original.setIconText("Original")
         self.backdrop_combo = QComboBox()
         self.backdrop_combo.setToolTip("Background shown behind the cutout (preview only)")
-        for bd, label in ((Backdrop.CHECKER, "Checkerboard"), (Backdrop.WHITE, "White"), (Backdrop.BLACK, "Black")):
+        for bd, label in ((Backdrop.CHECKER, "Checker"), (Backdrop.WHITE, "White"), (Backdrop.BLACK, "Black")):
             self.backdrop_combo.addItem(label, bd)
         self.backdrop_combo.currentIndexChanged.connect(
             lambda i: self.set_backdrop(self.backdrop_combo.itemData(i)))
         tb.addWidget(self.backdrop_combo)
         tb.addSeparator()
-        tb.addAction(self.act_zoom_out)
-        self.act_zoom_out.setText("−")
+        # Zoom in/out live on the wheel, Ctrl +/- and the View menu; Fit stays one click away.
         tb.addAction(self.act_fit)
         self.act_fit.setText("Fit")
-        tb.addAction(self.act_zoom_in)
-        self.act_zoom_in.setText("+")
         tb.addSeparator()
 
         self.save_button = QPushButton("Save PNG")
@@ -498,7 +527,15 @@ class MainWindow(QMainWindow):
             canvas=self.canvas,
             run_in_background=self.run_in_background,
             show_message=lambda msg: self.statusBar().showMessage(msg, 4000),
+            report_error=lambda title, exc: self._report_error(title, exc),
+            set_busy=self._set_tool_busy,
         )
+
+    def _set_tool_busy(self, text: str | None) -> None:
+        if text:
+            self._push_busy(text)
+        else:
+            self._pop_busy()
 
     def register_tool(self, tool: CanvasTool, shortcut: str | None = None) -> QAction:
         """Add a touch-up tool to the toolbar and Tools menu."""
@@ -514,11 +551,16 @@ class MainWindow(QMainWindow):
         act.setStatusTip(tool.tooltip or tool.label)
         act.triggered.connect(lambda _c=False, tid=tool.id: self.activate_tool(tid))
         self.tool_group.addAction(act)
-        self.toolbar.insertAction(self._tools_marker, act)
+        self.tools_bar.addAction(act)
         self.tools_menu.addAction(act)
         self.addAction(act)
         self._tools[tool.id] = tool
         self._tool_actions[tool.id] = act
+        widget = tool.options_widget()
+        if widget is not None and id(widget) not in self._option_actions:
+            opt = self.options_bar.addWidget(widget)
+            opt.setVisible(False)
+            self._option_actions[id(widget)] = opt
         self._sync_actions()
         return act
 
@@ -532,6 +574,12 @@ class MainWindow(QMainWindow):
         tool.activate(self.tool_context())
         self._tool_actions[tool_id].setChecked(True)
         self.canvas.set_tool(tool)
+        widget = tool.options_widget()
+        shown = self._option_actions.get(id(widget)) if widget is not None else None
+        for opt in self._option_actions.values():
+            opt.setVisible(opt is shown)
+        self.options_bar.setVisible(shown is not None)
+        self.canvas.setFocus()
 
     @property
     def active_tool(self) -> CanvasTool | None:
@@ -602,6 +650,8 @@ class MainWindow(QMainWindow):
         self.act_original.setEnabled(has_alpha)
         self.act_undo.setEnabled(self.doc.undo_stack.canUndo() and not busy)
         self.act_redo.setEnabled(self.doc.undo_stack.canRedo() and not busy)
+        self.tb_undo.setEnabled(self.act_undo.isEnabled())
+        self.tb_redo.setEnabled(self.act_redo.isEnabled())
         for b in self.subject_buttons.values():
             b.setEnabled(not busy)
         for tid, act in self._tool_actions.items():

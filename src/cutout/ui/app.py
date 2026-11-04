@@ -28,13 +28,14 @@ QToolBar#mainToolbar {{
     background: #2a2b2f; border: none; border-bottom: 1px solid #36373c;
     padding: 6px 10px; spacing: 6px;
 }}
-QToolBar#mainToolbar QToolButton {{
+QToolBar#toolsToolbar {{ background: #2a2b2f; border: none; border-right: 1px solid #36373c; padding: 8px 6px; spacing: 4px; }}
+QToolBar#mainToolbar QToolButton, QToolBar#toolsToolbar QToolButton {{
     color: #e8eaed; background: transparent; border: 1px solid transparent;
     border-radius: 6px; padding: 5px 10px;
 }}
-QToolBar#mainToolbar QToolButton:hover {{ background: #36383d; }}
-QToolBar#mainToolbar QToolButton:checked {{ background: #3a4a6b; border-color: {ACCENT}; }}
-QToolBar#mainToolbar QToolButton:disabled {{ color: #6b6d72; }}
+QToolBar#mainToolbar QToolButton:hover, QToolBar#toolsToolbar QToolButton:hover {{ background: #36383d; }}
+QToolBar#mainToolbar QToolButton:checked, QToolBar#toolsToolbar QToolButton:checked {{ background: #3a4a6b; border-color: {ACCENT}; }}
+QToolBar#mainToolbar QToolButton:disabled, QToolBar#toolsToolbar QToolButton:disabled {{ color: #6b6d72; }}
 QToolBar#mainToolbar::separator {{ background: #3a3b40; width: 1px; margin: 4px 6px; }}
 QLabel#toolbarCaption {{ color: #9aa0a6; padding-right: 4px; }}
 
@@ -57,11 +58,27 @@ QPushButton#primaryButton:disabled {{ background: #3a3c42; color: #7d8086; }}
 
 QComboBox {{
     background: #1f2023; color: #e8eaed; border: 1px solid #44464c; border-radius: 6px;
-    padding: 4px 10px; min-width: 110px;
+    padding: 4px 10px; min-width: 70px;
 }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
 QComboBox QAbstractItemView {{
     background: #2a2b2f; color: #e8eaed; border: 1px solid #44464c; selection-background-color: #3a4a6b;
+}}
+
+QToolBar#optionsToolbar {{
+    background: #26272b; border: none; border-bottom: 1px solid #36373c; padding: 4px 10px; spacing: 6px;
+}}
+QToolBar#optionsToolbar QLabel {{ color: #bdc1c6; }}
+QLabel#optionsHint {{ color: #80868b; }}
+QPushButton#optionButton {{
+    background: #33353a; color: #e8eaed; border: 1px solid #44464c; border-radius: 6px; padding: 4px 12px;
+}}
+QPushButton#optionButton:hover {{ background: #3d3f45; }}
+QPushButton#optionButton:disabled {{ color: #6b6d72; border-color: #36373c; }}
+QSlider::groove:horizontal {{ height: 4px; background: #44464c; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
+QSlider::handle:horizontal {{
+    background: #e8eaed; width: 14px; height: 14px; margin: -6px 0; border-radius: 7px;
 }}
 
 QLabel#emptyTitle {{ color: #e8eaed; font-size: 22pt; font-weight: 600; }}

@@ -298,6 +298,7 @@ in the packaged `Cutout.exe`). Files in `src/cutout/ui`:
 | `tools.py` | `CanvasTool` base + `ToolContext`: the hook the touch-up tools plug into. |
 | `workers.py` | `Task` on `QThreadPool`; results come back as signals on the UI thread. |
 | `head_tool.py` | Mark Face tool: drag a box over a face when Head only finds none (or the wrong one). |
+| `touchup.py` | Keep / Erase / Refine brushes and click-to-select on top of `cutout.editing`. `MatteBridge` keeps one `MatteEditor` (no own history) on the current matte and pushes each finished stroke or selection to the window's `QUndoStack` as a rect patch. Brush size is a diameter in image pixels (1 to 1000); under 5 px dabs snap to the pixel grid and paint whole pixels (`editing.brush.pixel_stamp`). |
 
 Behaviour worth knowing:
 

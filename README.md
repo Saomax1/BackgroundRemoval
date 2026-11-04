@@ -6,8 +6,8 @@ your NVIDIA graphics card to go fast, and never shrinks your picture: what comes
 out is exactly the same size as what went in.
 
 **Where things stand:** the background-removal engine works from a command
-window today. The point-and-click app and the touch-up brush are being built
-next. A one-click `Setup.exe` is built automatically on GitHub: download it
+window and in the editor window, which also has touch-up brushes and
+click-to-select. A one-click `Setup.exe` is built automatically on GitHub: download it
 from the [latest release](https://github.com/Saomax1/BackgroundRemoval/releases/latest)
 (no sign-in needed). The first time Cutout starts it downloads its AI models
 (about 3 GB, once). To update later, choose **Help > Check for Updates** in the
@@ -129,6 +129,21 @@ picture; switching re-runs the removal. Scroll to zoom, drag to move around,
 and press **O** to compare with the original. **Save PNG** writes a
 transparent PNG at the exact size of your picture, next to it as
 `name_cutout.png` by default.
+
+To fix anything the automatic step missed, pick a tool on the left:
+
+| Tool | Key | What it does |
+|---|---|---|
+| **Keep** | K | Paint back parts of the subject that were removed. |
+| **Erase** | E | Paint away leftover background. Hold **Alt** to switch between Keep and Erase. |
+| **Refine Edge** | R | Brush over hair or fur so the edge follows the photo. |
+| **Select** | S | Click a whole part (a sleeve, a gap between arms). Right-click excludes. **Enter** keeps the blue area, **Delete** removes it, **Esc** clears. |
+
+The brush size is in pixels of your full-size picture, from **1 px** (exactly
+one pixel, no feathering) up to 1000 px. Change it with the Size slider, the
+number box, the **1 px** button, `[` and `]`, or Ctrl+scroll. Zoom in (scroll,
+up to 6400%) to work on single pixels; from 800% a grid shows every pixel.
+**Ctrl+Z** undoes each stroke or selection.
 
 ## Removing a background from the command line
 
