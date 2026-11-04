@@ -175,6 +175,11 @@ engine.release_models()  # unload everything, e.g. before a memory-hungry step
   so the next image tries the GPU again. Otherwise it raises `GpuOutOfMemory`
   with a readable message. Never recover inside the `except` block: the live
   traceback keeps the failed session (and its VRAM) alive.
+- The exported deformable convolutions (`scripts/onnx_deform_conv.py`) sample
+  one kernel row at a time. Sampling all 49 taps of BiRefNet's 7x7 ASPP branch
+  at once made a 3.3 GB temporary at 2048 px, which ran an 8 GB RTX 3070 out of
+  memory or pushed it into the driver's system-memory fallback (25-51 s runs
+  instead of about 7 s).
 - Output resolution is unaffected by all of this: models run at their fixed size.
 
 ### Contracts for the follow-on work

@@ -22,6 +22,15 @@ def _pair(v):
 
 
 def deform_conv2d(input, offset, weight, bias=None, stride=(1, 1), padding=(0, 0), dilation=(1, 1), mask=None):
+    """Modulated deformable conv, one kernel row at a time.
+
+    Sampling every tap at once builds a ``c x k x ho x wo`` tensor: for the 7x7
+    ASPP branch of BiRefNet at 2048 px that is 64 x 49 x 512 x 512 floats = 3.3 GB,
+    twice over (grid_sample output and the masked copy). That alone ran an 8 GB
+    card out of memory, or into Windows' slow system-memory fallback. Doing one
+    kernel row per step and summing the partial matmuls is the same arithmetic
+    with a ``kh``-times smaller peak (a 7x7 kernel: 470 MB instead of 3.3 GB).
+    """
     b, c, h, w = input.shape
     out_ch, cg, kh, kw = weight.shape
     sh, sw = _pair(stride)
@@ -33,30 +42,34 @@ def deform_conv2d(input, offset, weight, bias=None, stride=(1, 1), padding=(0, 0
     groups = c // cg  # weight groups
     dt = input.dtype
 
-    # Sampling position of kernel tap (i, j) for output pixel (y, x), before the learned offset.
+    # Sampling position of output pixel (y, x) for kernel column j, before the learned offset.
     ys = torch.arange(ho, dtype=dt) * sh - ph
     xs = torch.arange(wo, dtype=dt) * sw - pw
-    ki = (torch.arange(kh, dtype=dt) * dh).repeat_interleave(kw)
-    kj = (torch.arange(kw, dtype=dt) * dw).repeat(kh)
-    base_y = ys.view(1, 1, 1, ho, 1) + ki.view(1, 1, k, 1, 1)
-    base_x = xs.view(1, 1, 1, 1, wo) + kj.view(1, 1, k, 1, 1)
+    kj = torch.arange(kw, dtype=dt) * dw
+    base_x = xs.view(1, 1, 1, 1, wo) + kj.view(1, 1, kw, 1, 1)
 
     off = offset.reshape(b, og, k, 2, ho, wo)  # torchvision order: (dy, dx) per tap
-    py = base_y + off[:, :, :, 0]
-    px = base_x + off[:, :, :, 1]
-    # grid_sample with align_corners=True maps -1/+1 to the first/last pixel centre.
-    gx = px * (2.0 / max(w - 1, 1)) - 1.0
-    gy = py * (2.0 / max(h - 1, 1)) - 1.0
-    grid = torch.stack([gx, gy], dim=-1).reshape(b * og, k * ho, wo, 2)
-    sampled = F.grid_sample(
-        input.reshape(b * og, c // og, h, w), grid, mode="bilinear", padding_mode="zeros", align_corners=True
-    )  # (b*og, c/og, k*ho, wo)
-    sampled = sampled.reshape(b, og, c // og, k, ho, wo)
-    if mask is not None:
-        sampled = sampled * mask.reshape(b, og, 1, k, ho, wo)
-    cols = sampled.reshape(b, groups, cg * k, ho * wo)
-    wmat = weight.reshape(groups, out_ch // groups, cg * k)
-    out = torch.matmul(wmat.unsqueeze(0), cols).reshape(b, out_ch, ho, wo)
+    mk = mask.reshape(b, og, 1, k, ho, wo) if mask is not None else None
+    feats = input.reshape(b * og, c // og, h, w)
+    wmat = weight.reshape(groups, out_ch // groups, cg, kh, kw)
+    out = None
+    for i in range(kh):  # unrolled by the tracer: kh GridSample nodes per layer
+        taps = slice(i * kw, (i + 1) * kw)
+        py = (ys.view(1, 1, 1, ho, 1) + i * dh) + off[:, :, taps, 0]
+        px = base_x + off[:, :, taps, 1]
+        # grid_sample with align_corners=True maps -1/+1 to the first/last pixel centre.
+        gx = px * (2.0 / max(w - 1, 1)) - 1.0
+        gy = py * (2.0 / max(h - 1, 1)) - 1.0
+        grid = torch.stack([gx, gy], dim=-1).reshape(b * og, kw * ho, wo, 2)
+        sampled = F.grid_sample(
+            feats, grid, mode="bilinear", padding_mode="zeros", align_corners=True
+        ).reshape(b, og, c // og, kw, ho, wo)
+        if mk is not None:
+            sampled = sampled * mk[:, :, :, taps]
+        cols = sampled.reshape(b, groups, cg * kw, ho * wo)
+        part = torch.matmul(wmat[:, :, :, i].reshape(1, groups, out_ch // groups, cg * kw), cols)
+        out = part if out is None else out + part
+    out = out.reshape(b, out_ch, ho, wo)
     if bias is not None:
         out = out + bias.view(1, -1, 1, 1)
     return out
