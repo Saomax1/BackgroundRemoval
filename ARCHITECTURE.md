@@ -53,6 +53,13 @@ If the installer is tight on space, ship B+ only; it is close to L for this use.
 * Choosing person vs anime is a UI toggle for now. Auto-detection (a tiny
   classifier) is a possible later improvement.
 
+Head only uses one more model, small enough to ship inside the app itself (so it
+arrives with an ordinary app update, no model pack):
+
+| Use | Model | Size | Source |
+|---|---|---|---|
+| Finding faces for Head only | **YuNet** 2023mar (`core/data/face_detection_yunet_2023mar.onnx`) | 230 KB | `opencv/opencv_zoo`, MIT licence. Run by OpenCV (`cv2.FaceDetectorYN`) on the CPU. |
+
 ## Pipeline
 
 ```
@@ -75,6 +82,31 @@ load_image ──► Segmenter.predict ──► refine_alpha ──► (user ed
    bit-exact copies of the input. Output dtype matches input (8 or 16-bit).
 5. **Save** (`imageio.save_png`): lossless PNG encoded on all cores (`png.py`),
    atomic write, ICC profile embedded for 8 and 16-bit.
+
+### Head only
+
+`core/head.py`, `CutoutEngine.head_only(image, alpha, subject, faces=None)`. A step
+*after* the automatic removal: it changes the matte only, so the head keeps the full
+cutout quality and the output keeps the full input size (nothing is cropped).
+
+1. **Find the face(s).** YuNet runs on the CPU (tens of ms; nothing goes on the GPU)
+   on a copy of the area around the cutout, shrunk to 1280 px at most. Photos use
+   confidence 0.6, anime 0.4, then one retry at 0.25. Faces off the cutout and faces
+   much smaller than the biggest one are ignored; every other face's head is kept.
+   YuNet is trained on photos but finds most front-facing anime faces too.
+2. **Cut at the neck**, square to the face's tilt (from the eye landmarks): 0.2 face
+   heights below the chin under the face, rising to chin level beside the neck, so
+   raised shoulders stay off. Feathered over ~3% of the face height.
+3. **Keep what is connected to the face** above that cut: hair, hats, buns. Parts that
+   stick out of the head's core oval, rise from the shoulder line to far above eye level
+   and are arm-thin are taken for raised arms and dropped.
+
+When no face is found (a face turned away, a very stylised drawing) the window keeps
+the whole cutout and switches to the **Mark Face** tool (F): the user drags a box from
+forehead to chin and that box is used as the face. In the window, Head only is a
+switch (toolbar and next to Remove Background): before a cutout it says what the
+button makes; after one it cuts the head out or puts the whole cutout back, as
+undoable steps, without running the model again. `cutout --head` does it from the CLI.
 
 ### CPU and GPU in tandem
 
@@ -124,6 +156,7 @@ src/cutout/
     refine.py      upsample, guided filter, foreground estimation, compose
     engine.py      CutoutEngine: the public API the UI and CLI use
     prompt_segmenter.py  PromptSegmenter protocol + OnnxSamSegmenter (click-to-select model)
+    head.py        Head only: face finding (YuNet, data/) and the cut at the neck
     debug.py       log files, debug mode, crash detection, memory snapshots, the debug report
   cli.py           command-line front end (dev, benchmarks, installer smoke test)
   editing/         touch-up tools, pure NumPy/OpenCV on the alpha matte, no Qt
@@ -264,6 +297,7 @@ in the packaged `Cutout.exe`). Files in `src/cutout/ui`:
 | `canvas.py` | `CutoutCanvas`: `QGraphicsView` with screen-space checkerboard (or white/black), wheel zoom at cursor, drag/Space/middle-button pan, "show original" compare. |
 | `tools.py` | `CanvasTool` base + `ToolContext`: the hook the touch-up tools plug into. |
 | `workers.py` | `Task` on `QThreadPool`; results come back as signals on the UI thread. |
+| `head_tool.py` | Mark Face tool: drag a box over a face when Head only finds none (or the wrong one). |
 
 Behaviour worth knowing:
 

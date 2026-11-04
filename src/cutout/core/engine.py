@@ -53,6 +53,7 @@ from .models import (
     resolve_prompt_model,
 )
 from .prompt_segmenter import OnnxSamSegmenter, PromptSegmenter
+from .head import Face, FaceFinder, HeadCut, head_only
 from . import debug, parallel
 from .refine import ImagePrep, RefineOptions, compose_rgba, prepare_image, refine_alpha
 from .runtime import GpuOutOfMemory, is_out_of_memory
@@ -146,6 +147,7 @@ class CutoutEngine:
         self._warming: tuple[str, Segmenter, threading.Event] | None = None
         self._warm: set[str] = set()
         self._max_resident = max_resident
+        self._face_finder: FaceFinder | None = None
 
     def segmenter_for(self, subject: Subject, model_id: str | None = None) -> Segmenter:
         return self._segmenter(resolve_model(subject, self.models_dir, model_id))
@@ -214,6 +216,34 @@ class CutoutEngine:
 
         img = image.image if isinstance(image, CutoutResult) else image
         return ClickSelector(self.prompt_segmenter(model_id), img, opts or SelectOptions(refine=self.refine))
+
+    @property
+    def face_finder(self) -> FaceFinder:
+        """The face detector behind Head only (tiny, CPU only, shipped with the app)."""
+        with self._lock:
+            if self._face_finder is None:
+                self._face_finder = FaceFinder()
+            return self._face_finder
+
+    def head_only(
+        self,
+        image: LoadedImage,
+        alpha: np.ndarray,
+        subject: Subject = Subject.PERSON,
+        faces: list[Face] | None = None,
+    ) -> HeadCut:
+        """Keep only the head(s) of a cutout: ``alpha`` with the rest made transparent.
+
+        Runs on the CPU (tens of milliseconds), never on the GPU. ``faces`` skips the
+        detector (a box the user drew). Raises ``head.NoFaceFound`` if no face is on the
+        cutout. ``alpha`` is not changed.
+        """
+        t = time.perf_counter()
+        cut = head_only(image.as_uint8(), alpha, subject, faces, self.face_finder)
+        debug.record_timings(f"head only {image.width}x{image.height}",
+                             {"head only": time.perf_counter() - t}, faces=len(cut.faces),
+                             drawn_by_user=faces is not None)
+        return cut
 
     def warmup(self, subject: Subject = Subject.PERSON, progress: "WarmupProgress | None" = None) -> bool:
         """Load the subject's model and run it once, so the user's first cutout is fast.

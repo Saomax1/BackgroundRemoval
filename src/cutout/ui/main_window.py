@@ -31,6 +31,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -46,7 +47,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import numpy as np
+
 from ..core.engine import CutoutEngine, CutoutResult
+from ..core.head import Face, HeadCut, NoFaceFound
 from ..core import debug, parallel
 from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, encode_rgba_png, load_image, write_png_bytes
 from ..core.models import REGISTRY, ModelNotInstalled, Subject
@@ -56,6 +60,7 @@ from ..core.refine import compose_rgba
 from . import debug_menu, update_ui
 from .canvas import Backdrop, CutoutCanvas
 from .document import CutoutDocument
+from .head_tool import HeadBoxTool
 from .tools import CanvasTool, PanTool, ToolContext
 from .workers import Task
 
@@ -71,6 +76,11 @@ def is_supported_image(path: str | os.PathLike) -> bool:
 
 def default_output_path(source: Path) -> Path:
     return source.with_name(f"{source.stem}_cutout.png")
+
+
+HEAD_ONLY_TIP = "Keep only the head (face, hair and hat), cut at the neck; everything else transparent"
+NO_FACE_TEXT = ("No face was found, so Cutout can't tell where the head is.\n\n"
+                "Drag a box over the face, from the forehead to the chin, and only that head will be kept.")
 
 
 # ============================================================== small widgets
@@ -204,7 +214,12 @@ class ConfirmBar(QWidget):
         self.button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.button.setToolTip("Start the automatic removal (Enter)")
         self.button.clicked.connect(self.confirmed)
+        self.head_only = QCheckBox("Head only")
+        self.head_only.setObjectName("confirmHeadOnly")
+        self.head_only.setToolTip(HEAD_ONLY_TIP)
+        self.head_only.setCursor(Qt.CursorShape.PointingHandCursor)
         row.addWidget(self.label)
+        row.addWidget(self.head_only)
         row.addWidget(self.button)
         self.hide()
 
@@ -226,6 +241,8 @@ class MainWindow(QMainWindow):
     saved = Signal(str)
     #: Emitted when a background task failed, with a user-facing message.
     task_failed = Signal(str)
+    #: Emitted when Head only found no face (the Mark Face tool is then active).
+    head_not_found = Signal()
 
     def __init__(
         self,
@@ -248,6 +265,9 @@ class MainWindow(QMainWindow):
         self._live_tasks: set[Task] = set()
         # A save prepared in the background right after a cutout: (image, revision, decon, future).
         self._save_prep: tuple[LoadedImage, int, bool, Any] | None = None
+        # The whole cutout from before the last Head only, so Head only can be switched off
+        # (or the head re-marked) without running the model again. None when no head cut is shown.
+        self._full_alpha: np.ndarray | None = None
 
         self.warmup_tracker = WarmupTracker(self.settings, parent=self)
 
@@ -271,6 +291,8 @@ class MainWindow(QMainWindow):
         self.doc.undo_stack.indexChanged.connect(self._on_doc_edited)
 
         self.register_tool(PanTool(), shortcut="H")
+        self.head_tool = HeadBoxTool(self.mark_face)
+        self.register_tool(self.head_tool, shortcut="F")
         self.activate_tool("pan")
         self._restore_settings()
         self._sync_actions()
@@ -290,6 +312,7 @@ class MainWindow(QMainWindow):
         self.overlay = BusyOverlay(self.stack)
         self.confirm_bar = ConfirmBar(self.stack)
         self.confirm_bar.confirmed.connect(self.start_removal)
+        self.confirm_bar.head_only.toggled.connect(lambda on: self.act_head.setChecked(on))
         self.canvas.zoom_changed.connect(self._on_zoom_changed)
         self.canvas.hover_pixel.connect(self._on_hover_pixel)
 
@@ -324,6 +347,11 @@ class MainWindow(QMainWindow):
         # Enter starts the first removal of a freshly opened image (same as the button).
         self.act_confirm = a("Remove Background", self._confirm_removal)
         self.act_confirm.setShortcuts([QKeySequence(Qt.Key.Key_Return), QKeySequence(Qt.Key.Key_Enter)])
+        # Head only: before a cutout it says what the button will make; after one it cuts the
+        # head out of it (or puts the whole cutout back) as an undoable step.
+        self.act_head = a("Head Only", None, None, HEAD_ONLY_TIP, checkable=True)
+        self.act_head.toggled.connect(self._on_head_mode_changed)
+        self.act_head.triggered.connect(self._on_head_triggered)
         self.act_fit = a("Fit to Window", self.canvas.fit_to_window, QKeySequence("Ctrl+0"), "Fit the image in the window")
         self.act_100 = a("Actual Pixels", self.canvas.actual_pixels, QKeySequence("Ctrl+1"), "Zoom to 100%")
         self.act_zoom_in = a("Zoom In", self.canvas.zoom_in, QKeySequence.StandardKey.ZoomIn, "Zoom in")
@@ -379,6 +407,7 @@ class MainWindow(QMainWindow):
         self.subject_buttons[Subject.PERSON].setChecked(True)
         self.subject_group.buttonClicked.connect(self._on_subject_clicked)
         tb.addWidget(seg)
+        tb.addAction(self.act_head)
         tb.addAction(self.act_rerun)
         tb.addSeparator()
 
@@ -430,6 +459,7 @@ class MainWindow(QMainWindow):
         m.addAction(self.act_undo)
         m.addAction(self.act_redo)
         m.addSeparator()
+        m.addAction(self.act_head)
         m.addAction(self.act_rerun)
         self.tools_menu = mb.addMenu("&Tools")
         m = mb.addMenu("&View")
@@ -559,6 +589,7 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(has_alpha and not busy)
         self.act_close.setEnabled(has_img and not busy)
         self.act_rerun.setEnabled(has_img and not busy)
+        self.act_head.setEnabled(has_img and not busy)
         # Before the first cutout this is the "go" button; after it, a re-run.
         self.act_rerun.setText("Redo Auto" if has_alpha else "Remove Background")
         self.act_confirm.setEnabled(self._awaiting_confirm and not busy)
@@ -662,21 +693,130 @@ class MainWindow(QMainWindow):
         self._generation += 1
         gen = self._generation
         subject = self.subject
+        head = self.head_only
+        engine = self.engine
+
+        def work():
+            result = engine.remove_background(image, subject)
+            if not head:
+                return result, None
+            try:
+                return result, engine.head_only(image, result.alpha, subject)
+            except NoFaceFound:
+                return result, None
+
         self._push_busy("Removing background…")
         self.run_in_background(
-            self.engine.remove_background, image, subject,
-            on_done=lambda r: self._on_removed(gen, image, r),
+            work,
+            on_done=lambda r: self._on_removed(gen, image, *r, head_wanted=head),
             on_error=lambda e: self._on_remove_failed(gen, subject, e),
         )
 
-    def _on_removed(self, gen: int, image: LoadedImage, result: CutoutResult) -> None:
+    def _on_removed(self, gen: int, image: LoadedImage, result: CutoutResult,
+                    cut: HeadCut | None = None, head_wanted: bool = False) -> None:
         self._pop_busy()
         if gen != self._generation or image is not self.doc.image:
             return  # superseded by another open / run
+        self._full_alpha = None
+        if cut is not None:
+            self._full_alpha = result.alpha  # the whole cutout, for switching Head only off
+            result.alpha = cut.alpha
         self.doc.set_auto_result(result)
         if result.notice:
             self.statusBar().showMessage(result.notice, 15000)
+        if head_wanted and cut is None:
+            self._no_face_found()
         self.cutout_ready.emit()
+
+    # ------------------------------------------------------------ head only
+    @property
+    def head_only(self) -> bool:
+        return self.act_head.isChecked()
+
+    def set_head_only(self, on: bool) -> None:
+        """Like clicking Head Only: before a cutout it picks the mode, after one it applies it."""
+        if self.act_head.isChecked() != bool(on):
+            self.act_head.setChecked(bool(on))
+            self._on_head_triggered(bool(on))
+
+    def _on_head_mode_changed(self, on: bool) -> None:
+        self.settings.setValue("head_only", bool(on))
+        box = self.confirm_bar.head_only
+        if box.isChecked() != on:
+            box.blockSignals(True)
+            box.setChecked(on)
+            box.blockSignals(False)
+
+    def _show_head_checked(self, on: bool) -> None:
+        """Show the switch on or off without applying anything or changing the saved choice."""
+        self.act_head.blockSignals(True)
+        self.act_head.setChecked(on)
+        self.act_head.blockSignals(False)
+        box = self.confirm_bar.head_only
+        box.blockSignals(True)
+        box.setChecked(on)
+        box.blockSignals(False)
+
+    def _on_head_triggered(self, on: bool) -> None:
+        if not self.doc.has_alpha or self.is_busy:
+            return  # no cutout yet: it only picks what Remove Background makes
+        if on:
+            self._cut_head()
+        elif self._full_alpha is not None:
+            full, self._full_alpha = self._full_alpha, None
+            self.doc.replace_alpha(full, "Whole cutout")
+            self._prepare_save_in_background()
+            self.statusBar().showMessage("Showing the whole cutout again.", 4000)
+
+    def mark_face(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        """Keep only the head of the face the user boxed (the Mark Face tool)."""
+        if not self.doc.has_alpha or self.is_busy:
+            return
+        self._cut_head([Face.from_box(x0, y0, x1, y1)], source=self._full_alpha)
+
+    def _cut_head(self, faces: list[Face] | None = None, source: np.ndarray | None = None) -> None:
+        image = self.doc.image
+        source = self.doc.snapshot_alpha() if source is None else source
+        subject = self.subject
+        self._push_busy("Finding the head…")
+
+        def done(cut: HeadCut) -> None:
+            self._pop_busy()
+            if image is not self.doc.image or not self.doc.has_alpha:
+                return
+            self._full_alpha = source
+            self.doc.replace_alpha(cut.alpha, "Head only")
+            self._show_head_checked(True)
+            self._prepare_save_in_background()
+            n = len(cut.faces)
+            self.statusBar().showMessage(
+                "Kept the head." if n == 1 else f"Kept {n} heads.", 6000)
+
+        def failed(exc: BaseException) -> None:
+            self._pop_busy()
+            if isinstance(exc, NoFaceFound):
+                if image is self.doc.image:
+                    self._no_face_found()
+            else:
+                self._show_head_checked(self._full_alpha is not None)
+                self._report_error("Head only failed", exc)
+
+        self.run_in_background(self.engine.head_only, image, source, subject, faces,
+                               on_done=done, on_error=failed)
+
+    def _no_face_found(self) -> None:
+        """Keep the whole cutout and let the user box the face instead."""
+        self._show_head_checked(False)
+        self.activate_tool(self.head_tool.id)
+        self.statusBar().showMessage("No face found: drag a box over the face, from the forehead to the chin.", 20000)
+        log.info("head only: no face found; asking the user to mark it")
+        self.head_not_found.emit()
+        if self.ask_user:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("Head only")
+            box.setText(NO_FACE_TEXT)
+            box.open()  # not modal-blocking: the user goes straight on to drawing the box
 
     def _on_remove_failed(self, gen: int, subject: Subject, exc: BaseException) -> None:
         self._pop_busy()
@@ -823,6 +963,8 @@ class MainWindow(QMainWindow):
     def _on_image_changed(self) -> None:
         img = self.doc.image
         self._save_prep = None  # the old image's prepared PNG is no use any more
+        self._full_alpha = None
+        self._show_head_checked(bool(self.settings.value("head_only", False, type=bool)))
         self.act_original.setChecked(False)
         self.canvas.set_show_original(False)
         self.warmup_tracker.changed.emit()  # the loading bar moves between screen and status bar
@@ -962,6 +1104,7 @@ class MainWindow(QMainWindow):
             self.set_subject(Subject(self.settings.value("subject", Subject.PERSON.value)), rerun=False)
         except ValueError:
             pass
+        self._show_head_checked(bool(self.settings.value("head_only", False, type=bool)))
         try:
             self.set_backdrop(Backdrop(self.settings.value("backdrop", Backdrop.CHECKER.value)))
         except ValueError:
