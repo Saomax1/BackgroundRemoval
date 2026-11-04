@@ -231,3 +231,19 @@ def test_unsupported_file_rejected(window, tmp_path):
     window.task_failed.connect(errors.append)
     window.open_path(p)
     assert errors and not window.doc.has_image
+
+
+def test_task_finishing_after_its_window_closed_does_not_crash(qapp):
+    """0.1.16 crash on close: 'RuntimeError: Signal source has been deleted' in workers.run."""
+    import shiboken6
+
+    from cutout.ui.workers import Task
+
+    task = Task(lambda: 42)
+    task.setAutoDelete(False)
+    shiboken6.delete(task.signals)  # what Qt does to it when the app shuts down
+    task.run()  # must not raise
+    failing = Task(lambda: 1 / 0)
+    failing.setAutoDelete(False)
+    shiboken6.delete(failing.signals)
+    failing.run()

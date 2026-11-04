@@ -9,9 +9,12 @@ Everything is synchronous and thread-safe to call from a worker thread
 its main thread. Sessions are created lazily and cached, because loading a
 1 GB model onto the GPU takes seconds; call ``warmup()`` at app start.
 
-Only one automatic-removal model is kept loaded at a time: switching Person ->
-Anime unloads the person model first, because the 2048 px person model and the
-anime model together do not fit on a typical gaming card. If a run still runs
+Up to ``max_resident`` automatic-removal models stay loaded (two on cards with
+about 8 GB or more, one otherwise; least recently used goes first), and
+``warmup_all()`` runs them once in the background at start, because a fresh
+ONNX Runtime session is several times slower on its first run. GPU runs are
+serialised, so a cutout started during a warm-up waits for it and then runs
+warm. Loading a model makes room first, so two are never loading together. If a run still runs
 out of GPU memory, the engine unloads everything, retries once on the GPU, and
 then (with ``device="auto"``) runs that one image on the CPU and says so in
 ``CutoutResult.notice``. The output resolution never changes.
@@ -39,6 +42,7 @@ import numpy as np
 
 from .imageio import LoadedImage, load_image, save_png
 from .models import (
+    ModelNotInstalled,
     ModelSpec,
     PromptModelSpec,
     Subject,
@@ -61,6 +65,28 @@ CPU_FALLBACK_NOTICE = (
     "It is the same quality, just slower. Closing other programs that use the graphics card "
     "(games, browsers with many tabs, video editors) lets the next one run on the GPU again."
 )
+
+# Total VRAM from which both automatic-removal models stay loaded. Measured on an 8 GB
+# RTX 3070: person (2048) + anime (1024) sessions hold ~2.7 GB together, and a person run
+# peaks well under the rest now that the deformable convs are exported in slices.
+KEEP_BOTH_MIN_VRAM_MIB = 7500
+
+
+def default_max_resident(device: str) -> int:
+    """2 on a GPU with enough memory (or on the CPU, where RAM is plentiful), else 1."""
+    env = os.environ.get("CUTOUT_MAX_LOADED_MODELS", "").strip()
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    if device == "cpu":
+        return 2
+    try:
+        gpus = debug.gpu_usage()
+    except Exception:  # nvidia-smi missing or odd output: be conservative
+        gpus = []
+    if not gpus:
+        return 1
+    return 2 if gpus[0]["total_mib"] >= KEEP_BOTH_MIN_VRAM_MIB else 1
+
 
 SegmenterFactory = Callable[[ModelSpec, Path, str], Segmenter]
 PromptSegmenterFactory = Callable[[PromptModelSpec, Path, Path, str], PromptSegmenter]
@@ -95,6 +121,7 @@ class CutoutEngine:
         segmenter_factory: SegmenterFactory | None = None,
         prompt_segmenter_factory: PromptSegmenterFactory | None = None,
         select_device: str | None = None,
+        max_resident: int | None = None,
     ):
         self.models_dir = Path(models_dir) if models_dir else default_models_dir()
         self.device = device
@@ -108,21 +135,41 @@ class CutoutEngine:
         self._prompt_factory: PromptSegmenterFactory = prompt_segmenter_factory or OnnxSamSegmenter
         self._prompt_segmenters: dict[str, PromptSegmenter] = {}
         self._lock = threading.Lock()
+        # One network on the GPU at a time: a background warm-up and the user's run must not
+        # both hold activation memory, and a run queued behind a warm-up then starts warm.
+        self._infer_lock = threading.Lock()
+        self._warm: set[str] = set()
+        self._max_resident = max_resident
 
     def segmenter_for(self, subject: Subject, model_id: str | None = None) -> Segmenter:
         return self._segmenter(resolve_model(subject, self.models_dir, model_id))
 
+    @property
+    def max_resident(self) -> int:
+        """How many automatic-removal models stay loaded at once (decided on first use).
+
+        A freshly loaded ONNX Runtime session is slow on its first run (on an RTX 3070 the
+        2048 px person model took ~24 s once, ~7 s after that), so unloading on every
+        Person/Anime switch made each switch pay that again. With enough VRAM both models
+        stay loaded and warm; on small cards only one does, as before.
+        """
+        if self._max_resident is None:
+            self._max_resident = default_max_resident(self.device)
+            log.info("keeping up to %d automatic-removal model(s) loaded", self._max_resident)
+        return self._max_resident
+
     def _segmenter(self, spec: ModelSpec) -> Segmenter:
         with self._lock:
-            seg = self._segmenters.get(spec.id)
+            seg = self._segmenters.pop(spec.id, None)
             if seg is None:
-                # Unload the previous model before loading the next one, so the two are
-                # never on the GPU together.
-                if self._segmenters:
-                    self._segmenters.clear()
-                    gc.collect()
+                # Make room first, so the old and new model are never both loading/running.
+                while self._segmenters and len(self._segmenters) >= self.max_resident:
+                    oldest = next(iter(self._segmenters))
+                    del self._segmenters[oldest]
+                    self._warm.discard(oldest)
+                gc.collect()
                 seg = self._factory(spec, model_path(spec, self.models_dir), self.device)
-                self._segmenters[spec.id] = seg
+            self._segmenters[spec.id] = seg  # most recently used last
         return seg
 
     @property
@@ -140,6 +187,7 @@ class CutoutEngine:
         with self._lock:
             self._segmenters.clear()
             self._prompt_segmenters.clear()
+            self._warm.clear()
         gc.collect()
 
     def prompt_segmenter(self, model_id: str | None = None) -> PromptSegmenter:
@@ -162,9 +210,26 @@ class CutoutEngine:
         return ClickSelector(self.prompt_segmenter(model_id), img, opts or SelectOptions(refine=self.refine))
 
     def warmup(self, subject: Subject = Subject.PERSON) -> None:
-        seg = self.segmenter_for(subject)
-        if hasattr(seg, "warmup"):
-            seg.warmup()
+        """Load the subject's model and run it once, so the user's first cutout is fast."""
+        spec = resolve_model(subject, self.models_dir)
+        with self._infer_lock:
+            if spec.id in self._warm and spec.id in self._segmenters:
+                return
+            seg = self._segmenter(spec)
+            if hasattr(seg, "warmup"):
+                t = time.perf_counter()
+                seg.warmup()
+                log.info("warmed up %s in %.1fs", spec.id, time.perf_counter() - t)
+            self._warm.add(spec.id)
+
+    def warmup_all(self, first: Subject = Subject.PERSON) -> None:
+        """Warm ``first``, then (if they can stay loaded together) the other subjects' models."""
+        order = [first] + [s for s in Subject if s is not first]
+        for subject in order[: self.max_resident]:
+            try:
+                self.warmup(subject)
+            except ModelNotInstalled:
+                continue
 
     def remove_background(
         self,
@@ -186,18 +251,26 @@ class CutoutEngine:
         notice = None
         t1 = time.perf_counter()
         oom: str | None = None
-        try:
-            seg = self._segmenter(spec)
-            coarse = seg.predict(rgb)
-        except Exception as exc:
-            if not is_out_of_memory(exc):
-                raise
-            # Recover outside this block: the live exception's traceback pins the failed
-            # session (and its GPU memory) until the block ends.
-            oom = str(exc)
-        if oom is not None:
-            seg = None
-            seg, coarse, notice = self._predict_after_oom(spec, rgb, oom)
+        with self._infer_lock:  # waits for a background warm-up, which leaves the model warm
+            timings["wait"] = time.perf_counter() - t1
+            t1 = time.perf_counter()
+            try:
+                seg = self._segmenter(spec)
+                timings["model_load"] = time.perf_counter() - t1
+                t1 = time.perf_counter()
+                coarse = seg.predict(rgb)
+            except Exception as exc:
+                if not is_out_of_memory(exc):
+                    raise
+                # Recover outside this block: the live exception's traceback pins the failed
+                # session (and its GPU memory) until the block ends.
+                oom = str(exc)
+            if oom is not None:
+                seg = None
+                seg, coarse, notice = self._predict_after_oom(spec, rgb, oom)
+            first_run = spec.id not in self._warm
+            if spec.id in self._segmenters:  # the CPU fallback copy is not kept, so not warm
+                self._warm.add(spec.id)
         timings["inference"] = time.perf_counter() - t1
         del rgb
 
@@ -212,6 +285,7 @@ class CutoutEngine:
         debug.record_timings(
             f"cutout {image.width}x{image.height}", timings, model=seg.name, device=device,
             cpu_prep_alongside_model=f"{prep_seconds:.2f}s", cpu_threads=parallel.cpu_threads(),
+            first_run_of_model=first_run,
         )
 
         return CutoutResult(

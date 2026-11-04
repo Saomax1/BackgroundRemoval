@@ -617,12 +617,10 @@ class MainWindow(QMainWindow):
             self._report_error("Background removal failed", exc)
 
     def warmup_in_background(self) -> None:
-        """Load the model for the current subject while the user picks a file."""
+        """Load and warm the current subject's model (then the other one, if both fit) while
+        the user picks a file. A cutout started meanwhile waits for it and then runs warm."""
         def warm(subject=self.subject):
-            try:
-                self.engine.warmup(subject)
-            except ModelNotInstalled:
-                pass  # reported when the user actually runs a removal
+            self.engine.warmup_all(subject)  # skips subjects with no model installed
         self.run_in_background(warm, on_error=lambda e: log.warning("warmup failed: %s", e))
 
     # --------------------------------------------------------------- saving

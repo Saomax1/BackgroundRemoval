@@ -159,9 +159,15 @@ engine.release_models()  # unload everything, e.g. before a memory-hungry step
 
 ### GPU and RAM use
 
-- One automatic-removal model is loaded at a time. Switching subject (or model)
-  drops the old session before the new one is created; the 2048 px person model
-  and ToonOut together don't fit on a typical 8-12 GB card.
+- A fresh ONNX Runtime session is much slower on its first run (RTX 3070, person
+  2048: ~24 s first, ~7 s after). So with 7.5 GB+ of VRAM both automatic-removal
+  models stay loaded (`max_resident`, least recently used goes first; override
+  with `CUTOUT_MAX_LOADED_MODELS`), and the app warms the current subject's model
+  and then the other in the background at start (`warmup_all`). On smaller
+  cards only one stays loaded. A new model is loaded only after the evicted one
+  is dropped, and GPU runs are serialised (`_infer_lock`): a cutout started
+  during a warm-up waits, then runs warm. The debug report's timings show
+  `wait`, `model_load` and `first_run_of_model` separately.
 - Sessions use `arena_extend_strategy=kSameAsRequested` and every run asks ORT
   to shrink the GPU arena afterwards (`memory.enable_memory_arena_shrinkage`),
   so activations are not parked in VRAM between runs. The CPU arena is off for
