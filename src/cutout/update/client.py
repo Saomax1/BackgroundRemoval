@@ -335,6 +335,10 @@ class Downloader:
         for mirror in self.mirrors:
             src = mirror / part.name
             if src.is_file():
+                # Only a byte-identical copy will do; anything else falls through to the download.
+                if src.stat().st_size != part.size or P.file_digest(src) != part.sha256:
+                    log.warning("local %s does not match the release, downloading it instead", src)
+                    continue
                 with open(src, "rb") as fin, open(partial, "wb") as fout:
                     while chunk := fin.read(_CHUNK):
                         fout.write(chunk)

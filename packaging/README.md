@@ -44,7 +44,10 @@ How it stays small: `packaging/make_release.py` splits the app folder into
 Each release has `cutout-release.json`, listing every pack's content hash, files
 and download parts. The app downloads only packs whose hash differs from what is
 installed. A pack that did not change keeps pointing at the release that first
-uploaded it, so the big packs are uploaded once. **Don't delete old releases**:
+uploaded it, so the big packs are uploaded once. Such a reused pack gets no local
+zip in the build, so the CI install test downloads it from the published release
+and checks its SHA-256, and `make_release.py` refuses to finish if any download
+in the manifest is missing or the wrong size. **Don't delete old releases**:
 newer ones may still download their models from them. Packs over 1.9 GB are split
 into parts, because GitHub caps release files at 2 GB.
 

@@ -42,10 +42,20 @@ def _sha256(path: Path) -> str:
 
 
 def write_zip(root: Path, files: list[str], dest: Path) -> None:
+    """Zip ``files`` byte-for-byte reproducibly: same content in, same zip out.
+
+    Fixed timestamps and permissions, so a rebuild of unchanged files on another
+    day does not produce a different archive under the same name.
+    """
     with zipfile.ZipFile(dest, "w", allowZip64=True) as zf:
-        for rel in files:
+        for rel in sorted(files):
             method = zipfile.ZIP_STORED if rel.lower().endswith(STORED_SUFFIXES) else zipfile.ZIP_DEFLATED
-            zf.write(root / rel, rel, compress_type=method, compresslevel=6 if method else None)
+            info = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = method
+            info.external_attr = 0o644 << 16
+            info.create_system = 0
+            with open(root / rel, "rb") as src, zf.open(info, "w", force_zip64=True) as dst:
+                shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
 
 
 def split(path: Path, part_size: int) -> list[Path]:
@@ -75,9 +85,14 @@ def split(path: Path, part_size: int) -> list[Path]:
 
 
 def build(app: Path, out: Path, version: str, base_url: str, previous: Manifest | None = None,
-          notes: str = "", part_size: int = DEFAULT_PART_SIZE,
-          skip_reused: bool = False) -> tuple[Manifest, list[Path]]:
-    """Return the manifest and the files this release has to upload."""
+          notes: str = "", part_size: int = DEFAULT_PART_SIZE) -> tuple[Manifest, list[Path]]:
+    """Return the manifest and the files this release has to upload.
+
+    A pack reused from ``previous`` gets no local zip: its download is the one
+    already published, whose checksum is in the manifest. (Rebuilding it here
+    under the same name once produced a file with different bytes, which the
+    install test then picked up and rejected.)
+    """
     if part_size >= GITHUB_LIMIT:
         raise SystemExit("--part-size must stay under GitHub's 2 GB file limit")
     out.mkdir(parents=True, exist_ok=True)
@@ -92,13 +107,14 @@ def build(app: Path, out: Path, version: str, base_url: str, previous: Manifest 
         size = sum((app / f).stat().st_size for f in files)
         old = previous.packs.get(name) if previous else None
         reused = old is not None and old.hash == digest and bool(old.parts)
-        if not (reused and skip_reused):  # local copies also serve the CI install test
+        if reused:
+            parts = old.parts  # same content: keep the earlier release's download
+            for part in parts:  # never leave a same-named local file that could differ
+                (out / part.name).unlink(missing_ok=True)
+        else:
             zip_path = out / f"cutout-{name}-{digest[:12]}.zip"
             write_zip(app, files, zip_path)
             local = split(zip_path, part_size)
-        if reused:
-            parts = old.parts  # same content: keep the earlier release's download
-        else:
             parts = [Part(p.name, f"{base_url}/{p.name}", p.stat().st_size, _sha256(p)) for p in local]
             upload += local
         manifest.packs[name] = Pack(name=name, hash=digest, size=size, files=files, parts=parts)
@@ -108,6 +124,49 @@ def build(app: Path, out: Path, version: str, base_url: str, previous: Manifest 
     manifest.save(out / MANIFEST_NAME)
     upload.append(out / MANIFEST_NAME)
     return manifest, upload
+
+
+def _remote_size(url: str, timeout: float = 30) -> int | None:
+    """Size of a published file. GitHub's storage refuses HEAD, so ask for one byte."""
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Cutout-Release-Check", "Range": "bytes=0-0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        total = (resp.headers.get("Content-Range") or "").rpartition("/")[2]
+        if total.isdigit():
+            return int(total)
+        length = resp.headers.get("Content-Length")
+        return int(length) if resp.status == 200 and length is not None else None
+
+
+def verify(manifest: Manifest, out: Path, remote_size=_remote_size) -> list[str]:
+    """Problems with the release's downloads; empty when every part checks out.
+
+    A part built here must be in ``out`` with the manifest's size and SHA-256. A
+    part reused from an earlier release must still be downloadable at its URL
+    with the manifest's size (the CI install test then downloads it and checks
+    its SHA-256 too, before anything is published).
+    """
+    problems = []
+    for pack in manifest.packs.values():
+        if not pack.parts:
+            problems.append(f"{pack.name}: no download")
+        for part in pack.parts:
+            local = out / part.name
+            if local.is_file():
+                if local.stat().st_size != part.size:
+                    problems.append(f"{part.name}: local size {local.stat().st_size} != manifest {part.size}")
+                elif _sha256(local) != part.sha256:
+                    problems.append(f"{part.name}: local SHA-256 does not match the manifest")
+                continue
+            try:
+                size = remote_size(part.url)
+            except Exception as exc:  # noqa: BLE001 - every failure is a problem to report
+                problems.append(f"{part.name}: cannot reach {part.url} ({exc})")
+                continue
+            if size is not None and size != part.size:
+                problems.append(f"{part.name}: {part.url} is {size} bytes, manifest says {part.size}")
+    return problems
 
 
 def stage_setup(app: Path, manifest: Manifest, setup_dir: Path) -> int:
@@ -136,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--notes-file", type=Path)
     ap.add_argument("--setup-dir", type=Path, help="also stage the Setup.exe input here")
     ap.add_argument("--part-size", type=int, default=DEFAULT_PART_SIZE)
-    ap.add_argument("--skip-reused", action="store_true", help="don't write zips for packs reused from --previous")
+    ap.add_argument("--no-check", action="store_true",
+                    help="skip checking the downloads (only for throwaway test releases)")
     args = ap.parse_args(argv)
 
     (args.app / P.RELEASE_FILE).unlink(missing_ok=True)
@@ -145,8 +205,13 @@ def main(argv: list[str] | None = None) -> int:
     if previous:
         print(f"previous release: {previous.version}")
     notes = args.notes_file.read_text(encoding="utf-8") if args.notes_file else ""
-    manifest, upload = build(args.app, args.out, args.version, args.base_url, previous, notes, args.part_size,
-                             args.skip_reused)
+    manifest, upload = build(args.app, args.out, args.version, args.base_url, previous, notes, args.part_size)
+    problems = [] if args.no_check else verify(manifest, args.out)
+    if problems:
+        print("release check FAILED:\n  " + "\n  ".join(problems), file=sys.stderr)
+        return 1
+    if not args.no_check:
+        print("release check: every download matches the manifest")
     manifest.save(args.app / P.RELEASE_FILE)
     (args.out / "upload.txt").write_text("\n".join(str(p) for p in upload) + "\n", encoding="utf-8")
     total = sum(p.download_size for p in manifest.packs.values())
