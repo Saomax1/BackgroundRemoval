@@ -165,8 +165,11 @@ engine.release_models()  # unload everything, e.g. before a memory-hungry step
   with `CUTOUT_MAX_LOADED_MODELS`), and the app warms the current subject's model
   and then the other in the background at start (`warmup_all`). On smaller
   cards only one stays loaded. A new model is loaded only after the evicted one
-  is dropped, and GPU runs are serialised (`_infer_lock`): a cutout started
-  during a warm-up waits, then runs warm. The debug report's timings show
+  is dropped, and GPU runs are serialised (`_infer_lock`). Cutouts go first: a
+  cutout for another model stops a running warm-up through ONNX Runtime's
+  `RunOptions.terminate` (the warm-up resumes afterwards), and no warm-up starts
+  while a cutout is waiting. A cutout for the model being warmed waits for it
+  and then runs warm. The debug report's timings show
   `wait`, `model_load` and `first_run_of_model` separately.
 - Sessions use `arena_extend_strategy=kSameAsRequested` and every run asks ORT
   to shrink the GPU arena afterwards (`memory.enable_memory_arena_shrinkage`),

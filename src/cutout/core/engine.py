@@ -56,7 +56,7 @@ from .prompt_segmenter import OnnxSamSegmenter, PromptSegmenter
 from . import debug, parallel
 from .refine import ImagePrep, RefineOptions, compose_rgba, prepare_image, refine_alpha
 from .runtime import GpuOutOfMemory, is_out_of_memory
-from .segmenter import OnnxSegmenter, Segmenter
+from .segmenter import OnnxSegmenter, Segmenter, WarmupCancelled
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +138,11 @@ class CutoutEngine:
         # One network on the GPU at a time: a background warm-up and the user's run must not
         # both hold activation memory, and a run queued behind a warm-up then starts warm.
         self._infer_lock = threading.Lock()
+        # Cutouts go before warm-ups: a cutout waiting for the GPU stops a warm-up of another
+        # model (which retries once the GPU is free), and no warm-up starts while one waits.
+        self._turns = threading.Condition()
+        self._cutouts_waiting = 0
+        self._warming: tuple[str, Segmenter, threading.Event] | None = None
         self._warm: set[str] = set()
         self._max_resident = max_resident
 
@@ -209,18 +214,45 @@ class CutoutEngine:
         img = image.image if isinstance(image, CutoutResult) else image
         return ClickSelector(self.prompt_segmenter(model_id), img, opts or SelectOptions(refine=self.refine))
 
-    def warmup(self, subject: Subject = Subject.PERSON) -> None:
-        """Load the subject's model and run it once, so the user's first cutout is fast."""
+    def warmup(self, subject: Subject = Subject.PERSON) -> bool:
+        """Load the subject's model and run it once, so the user's first cutout is fast.
+
+        Background work: it waits while any cutout wants the GPU, and a cutout for another
+        model stops it mid-run; it then tries again. Returns False only if the model has no
+        ``warmup``.
+        """
         spec = resolve_model(subject, self.models_dir)
-        with self._infer_lock:
-            if spec.id in self._warm and spec.id in self._segmenters:
-                return
-            seg = self._segmenter(spec)
-            if hasattr(seg, "warmup"):
+        while True:
+            with self._turns:
+                self._turns.wait_for(lambda: self._cutouts_waiting == 0)
+            with self._infer_lock:
+                if self._cutouts_waiting:
+                    continue  # a cutout arrived while we waited for the lock: it goes first
+                if spec.id in self._warm and spec.id in self._segmenters:
+                    return True
+                seg = self._segmenter(spec)
+                if not hasattr(seg, "warmup"):
+                    return False
+                with self._turns:
+                    if self._cutouts_waiting:
+                        continue
+                    cancel = threading.Event()
+                    self._warming = (spec.id, seg, cancel)
                 t = time.perf_counter()
-                seg.warmup()
-                log.info("warmed up %s in %.1fs", spec.id, time.perf_counter() - t)
-            self._warm.add(spec.id)
+                cancelled = False
+                try:
+                    seg.warmup(cancel=cancel)
+                except WarmupCancelled:
+                    cancelled = True
+                finally:
+                    with self._turns:
+                        self._warming = None
+                if not cancelled:
+                    log.info("warmed up %s in %.1fs", spec.id, time.perf_counter() - t)
+                    self._warm.add(spec.id)
+                    return True
+                log.info("paused warming up %s after %.1fs: a cutout needs the GPU",
+                         spec.id, time.perf_counter() - t)
 
     def warmup_all(self, first: Subject = Subject.PERSON) -> None:
         """Warm ``first``, then (if they can stay loaded together) the other subjects' models."""
@@ -248,10 +280,28 @@ class CutoutEngine:
         # GPU runs the network (ONNX Runtime releases the GIL during the run).
         prep_future = parallel.submit(_timed_prep, image, self.refine)
         rgb = image.as_uint8()
-        notice = None
         t1 = time.perf_counter()
+        with self._turns:
+            self._cutouts_waiting += 1
+            warming = self._warming
+        if warming is not None and warming[0] != spec.id:
+            # Another model's warm-up: stop it; it resumes once this cutout is done.
+            warming[2].set()
+            if hasattr(warming[1], "cancel_warmup"):
+                warming[1].cancel_warmup()
+        # (A warm-up of this same model is left to finish: this cutout then runs warm, which
+        # is no slower than running it cold now.)
+        try:
+            return self._remove_background_turn(image, spec, prep_future, rgb, timings, t1)
+        finally:
+            with self._turns:
+                self._cutouts_waiting -= 1
+                self._turns.notify_all()
+
+    def _remove_background_turn(self, image, spec, prep_future, rgb, timings, t1) -> CutoutResult:
+        notice = None
         oom: str | None = None
-        with self._infer_lock:  # waits for a background warm-up, which leaves the model warm
+        with self._infer_lock:
             timings["wait"] = time.perf_counter() - t1
             t1 = time.perf_counter()
             try:
