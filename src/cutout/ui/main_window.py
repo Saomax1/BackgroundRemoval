@@ -50,6 +50,7 @@ from ..core import debug, parallel
 from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, encode_rgba_png, load_image, write_png_bytes
 from ..core.models import REGISTRY, ModelNotInstalled, Subject
 from ..core.runtime import GpuOutOfMemory
+from .warmup import WarmupBar, WarmupTracker
 from ..core.refine import compose_rgba
 from . import debug_menu, update_ui
 from .canvas import Backdrop, CutoutCanvas
@@ -105,6 +106,12 @@ class EmptyState(QWidget):
         layout.addWidget(button, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addSpacing(6)
         layout.addWidget(formats)
+        self._layout = layout
+
+    def add_footer(self, widget: QWidget) -> None:
+        """Put ``widget`` (the model loading bar) under the drop-zone text."""
+        self._layout.addSpacing(28)
+        self._layout.addWidget(widget, 0, Qt.AlignmentFlag.AlignCenter)
 
     def set_drag_hover(self, on: bool) -> None:
         self._hover = on
@@ -207,6 +214,8 @@ class MainWindow(QMainWindow):
         # A save prepared in the background right after a cutout: (image, revision, decon, future).
         self._save_prep: tuple[LoadedImage, int, bool, Any] | None = None
 
+        self.warmup_tracker = WarmupTracker(self.settings, parent=self)
+
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
         self.resize(1280, 840)
@@ -237,6 +246,8 @@ class MainWindow(QMainWindow):
         self.canvas = CutoutCanvas(self.doc)
         self.empty = EmptyState()
         self.empty.open_requested.connect(self.open_dialog)
+        self.warmup_panel = WarmupBar(self.warmup_tracker)
+        self.empty.add_footer(self.warmup_panel)
         self.stack = QStackedWidget()
         self.stack.addWidget(self.empty)
         self.stack.addWidget(self.canvas)
@@ -399,7 +410,11 @@ class MainWindow(QMainWindow):
         self.lbl_model.setObjectName("modelBadge")
         self.lbl_pixel = QLabel()
         self.lbl_zoom = QLabel()
-        for w in (self.lbl_file, self.lbl_model, self.lbl_pixel, self.lbl_zoom):
+        # While an image is open the start screen is hidden, so the loading bar moves here.
+        self.warmup_status = WarmupBar(
+            self.warmup_tracker, compact=True, show_when=lambda: self.stack.currentWidget() is self.canvas
+        )
+        for w in (self.warmup_status, self.lbl_file, self.lbl_model, self.lbl_pixel, self.lbl_zoom):
             sb.addPermanentWidget(w)
         self.lbl_zoom.setMinimumWidth(52)
         self.lbl_pixel.setMinimumWidth(140)
@@ -619,8 +634,8 @@ class MainWindow(QMainWindow):
     def warmup_in_background(self) -> None:
         """Load and warm the current subject's model (then the other one, if both fit) while
         the user picks a file. A cutout started meanwhile waits for it and then runs warm."""
-        def warm(subject=self.subject):
-            self.engine.warmup_all(subject)  # skips subjects with no model installed
+        def warm(subject=self.subject, report=self.warmup_tracker.report):
+            self.engine.warmup_all(subject, progress=report)  # skips subjects with no model
         self.run_in_background(warm, on_error=lambda e: log.warning("warmup failed: %s", e))
 
     # --------------------------------------------------------------- saving
@@ -746,6 +761,7 @@ class MainWindow(QMainWindow):
         self._save_prep = None  # the old image's prepared PNG is no use any more
         self.act_original.setChecked(False)
         self.canvas.set_show_original(False)
+        self.warmup_tracker.changed.emit()  # the loading bar moves between screen and status bar
         if img is None:
             self.stack.setCurrentWidget(self.empty)
             self.lbl_file.clear()

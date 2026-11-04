@@ -88,6 +88,7 @@ def default_max_resident(device: str) -> int:
     return 2 if gpus[0]["total_mib"] >= KEEP_BOTH_MIN_VRAM_MIB else 1
 
 
+WarmupProgress = Callable[[str, str], None]  # (stage, model id)
 SegmenterFactory = Callable[[ModelSpec, Path, str], Segmenter]
 PromptSegmenterFactory = Callable[[PromptModelSpec, Path, Path, str], PromptSegmenter]
 
@@ -214,7 +215,7 @@ class CutoutEngine:
         img = image.image if isinstance(image, CutoutResult) else image
         return ClickSelector(self.prompt_segmenter(model_id), img, opts or SelectOptions(refine=self.refine))
 
-    def warmup(self, subject: Subject = Subject.PERSON) -> bool:
+    def warmup(self, subject: Subject = Subject.PERSON, progress: "WarmupProgress | None" = None) -> bool:
         """Load the subject's model and run it once, so the user's first cutout is fast.
 
         Background work: it waits while any cutout wants the GPU, and a cutout for another
@@ -222,6 +223,7 @@ class CutoutEngine:
         ``warmup``.
         """
         spec = resolve_model(subject, self.models_dir)
+        report = progress or (lambda stage, model_id: None)
         while True:
             with self._turns:
                 self._turns.wait_for(lambda: self._cutouts_waiting == 0)
@@ -230,6 +232,8 @@ class CutoutEngine:
                     continue  # a cutout arrived while we waited for the lock: it goes first
                 if spec.id in self._warm and spec.id in self._segmenters:
                     return True
+                if spec.id not in self._segmenters:
+                    report("load", spec.id)
                 seg = self._segmenter(spec)
                 if not hasattr(seg, "warmup"):
                     return False
@@ -238,6 +242,7 @@ class CutoutEngine:
                         continue
                     cancel = threading.Event()
                     self._warming = (spec.id, seg, cancel)
+                report("warm", spec.id)
                 t = time.perf_counter()
                 cancelled = False
                 try:
@@ -253,15 +258,38 @@ class CutoutEngine:
                     return True
                 log.info("paused warming up %s after %.1fs: a cutout needs the GPU",
                          spec.id, time.perf_counter() - t)
+                report("paused", spec.id)
 
-    def warmup_all(self, first: Subject = Subject.PERSON) -> None:
-        """Warm ``first``, then (if they can stay loaded together) the other subjects' models."""
+    def warmup_plan(self, first: Subject = Subject.PERSON) -> list[str]:
+        """Model ids ``warmup_all(first)`` will warm, in order (installed ones only)."""
         order = [first] + [s for s in Subject if s is not first]
+        plan = []
         for subject in order[: self.max_resident]:
             try:
-                self.warmup(subject)
+                plan.append(resolve_model(subject, self.models_dir).id)
             except ModelNotInstalled:
                 continue
+        return plan
+
+    def warmup_all(self, first: Subject = Subject.PERSON, progress: "WarmupProgress | None" = None) -> None:
+        """Warm ``first``, then (if they can stay loaded together) the other subjects' models.
+
+        ``progress(stage, model_id)`` is called from this thread with stage ``"load"``,
+        ``"warm"``, ``"paused"`` (a cutout took the GPU; it resumes) and finally
+        ``("done", "")``.
+        """
+        order = [first] + [s for s in Subject if s is not first]
+        if progress is not None:
+            progress("plan", ",".join(self.warmup_plan(first)))
+        try:
+            for subject in order[: self.max_resident]:
+                try:
+                    self.warmup(subject, progress)
+                except ModelNotInstalled:
+                    continue
+        finally:
+            if progress is not None:
+                progress("done", "")
 
     def remove_background(
         self,
