@@ -236,3 +236,9 @@ thrown away and started fresh.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how the engine is put together.
 Install with `pip install -e ".[gpu,ui,dev]"` (or `".[cpu,ui,dev]"` without an NVIDIA
 card) and run the tests with `pytest`. The tests need no models or GPU.
+
+## Credits
+
+Cutout is built on free, open-source AI models (BiRefNet, ToonOut, anime-segmentation,
+SAM 2.1 and YuNet) and libraries. Their authors and licenses are listed in
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which is also installed next to Cutout.exe.
