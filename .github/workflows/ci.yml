@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Tests only need to read the code.
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:

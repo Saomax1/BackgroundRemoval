@@ -22,6 +22,10 @@ on:
       - "pyproject.toml"
       - ".github/workflows/build-installer.yml"
 
+# Read-only token by default; only the release job asks for more.
+permissions:
+  contents: read
+
 concurrency:
   group: installer-${{ github.ref }}
   # Never cancel a main build half-way through publishing its release.
