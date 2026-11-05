@@ -303,3 +303,56 @@ def test_missing_select_model_reports_error(qapp, tmp_path):
     finally:
         wait_until(lambda: not w.is_busy)
         w.close()
+
+
+def _viewport_pixels(window):
+    from PySide6.QtGui import QImage
+
+    img = window.canvas.viewport().grab().toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+    arr = np.frombuffer(img.constBits(), np.uint8).reshape(img.height(), img.bytesPerLine() // 4, 4)
+    return arr[:, : img.width()].astype(int)
+
+
+@pytest.mark.parametrize("zoom", [0.13, 0.31, 0.5, 0.77, 2.5])
+@pytest.mark.parametrize("size", [200, 9])
+def test_fast_strokes_leave_no_lines_or_boxes(qapp, tmp_path, zoom, size):
+    """What is on screen after fast strokes must equal a clean repaint of the same matte."""
+    w = make_window(tmp_path)
+    try:
+        w.resize(1000, 700)
+        h, wd = 1500, 2000
+        yy, xx = np.mgrid[0:h, 0:wd]
+        rgb = np.dstack([xx * 255 // wd, yy * 255 // h, (xx + yy) % 256]).astype(np.uint8)
+        p = tmp_path / "grad.png"
+        Image.fromarray(rgb).save(p)
+        w.open_path(p)
+        wait_until(lambda: w.doc.has_image and not w.is_busy)
+        w.confirm_bar.button.click()
+        wait_until(lambda: w.doc.has_alpha and not w.is_busy)
+        w.canvas._set_zoom(zoom)
+        w.canvas.centerOn(1000, 750)
+        QApplication.processEvents()
+        w.activate_tool("brush-erase")
+        w.brush_settings.size = size
+        pts = [(700, 500), (1100, 700), (1400, 560), (1300, 1000), (900, 1050)]
+        mouse(w, "press", *pts[0])
+        for x, y in pts[1:]:  # few, far-apart events: a fast flick
+            mouse(w, "move", x, y, buttons=LEFT)
+            QApplication.processEvents()
+        mouse(w, "release", *pts[-1])
+        for i in range(20):  # the outline sweeping across the stroke
+            mouse(w, "move", 650 + i * 40, 480 + i * 30, buttons=Qt.MouseButton.NoButton)
+            QApplication.processEvents()
+        shown = _viewport_pixels(w)
+        # Clean reference: drop any item cache and repaint everything from the same buffer.
+        from PySide6.QtWidgets import QGraphicsItem
+
+        w.canvas._item.setCacheMode(QGraphicsItem.CacheMode.NoCache)
+        w.canvas._item.update()
+        w.canvas.viewport().update()
+        QApplication.processEvents()
+        clean = _viewport_pixels(w)
+        assert np.abs(shown - clean).max() <= 8
+    finally:
+        wait_until(lambda: not w.is_busy)
+        w.close()

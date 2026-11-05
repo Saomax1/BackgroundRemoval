@@ -64,20 +64,40 @@ class PreviewItem(QGraphicsItem):
         self.buffer = np.zeros((height, width, 4), np.uint8)
         self.qimage = QImage(self.buffer.data, width, height, width * 4, QImage.Format.Format_RGBA8888_Premultiplied)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption, True)
-        # Panning just blits the cache; only zoom changes or edited areas re-render.
-        self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        # No item cache: Qt's device cache re-rendered brush areas with half-painted edge
+        # pixels when zoomed out (lines and boxes left behind by strokes). Painting only the
+        # dirty part of the viewport straight from the buffer is fast enough and exact.
+        self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
 
     def boundingRect(self) -> QRectF:
         return QRectF(0, 0, self._w, self._h)
 
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget=None) -> None:
-        exposed = option.exposedRect.intersected(self.boundingRect()).toAlignedRect()
+        bounds = self.boundingRect()
+        exposed = option.exposedRect.intersected(bounds)
         if exposed.isEmpty():
             return
-        scale = painter.worldTransform().m11()
+        transform = painter.worldTransform()
+        scale = transform.m11()
+        # Repaint whole screen pixels. The exposed area is in image pixels; zoomed out, its
+        # edges fall inside screen pixels, and drawing only that much leaves those edge
+        # pixels half painted: thin lines and boxes around every brush stroke. So clip to the
+        # exposed area grown to whole screen pixels, and draw a little more source than that
+        # (so smoothing at the edge also samples the real neighbouring pixels).
+        inverse, ok = transform.inverted()
+        if ok:
+            device = transform.mapRect(exposed).toAlignedRect()
+            clip = inverse.mapRect(QRectF(device)).intersected(bounds)
+        else:
+            clip = exposed
+        margin = int(np.ceil(2.0 / max(scale, 1e-6))) + 1
+        src = clip.toAlignedRect().adjusted(-margin, -margin, margin, margin).intersected(bounds.toRect())
+        painter.save()
+        painter.setClipRect(clip, Qt.ClipOperation.IntersectClip)
         # Smooth when zoomed out; crisp, true pixels when zoomed in for editing.
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, scale < 1.0)
-        painter.drawImage(exposed, self.qimage, exposed)
+        painter.drawImage(QRectF(src), self.qimage, QRectF(src))
+        painter.restore()
 
 
 class CutoutCanvas(QGraphicsView):
@@ -215,7 +235,10 @@ class CutoutCanvas(QGraphicsView):
             a = np.round(np.clip(self.doc.alpha[y0:y1, x0:x1], 0.0, 1.0) * 255.0).astype(np.uint16)
             buf[..., :3] = ((rgb.astype(np.uint16) * a[..., None] + 127) // 255).astype(np.uint8)
             buf[..., 3] = a.astype(np.uint8)
-        self._item.update(QRectF(rect))
+        # Zoomed out, a changed pixel also shows in the neighbouring screen pixels
+        # (smoothing), so repaint a margin of a couple of screen pixels around it.
+        grow = int(np.ceil(2.0 / max(self.zoom, 1e-6))) + 1
+        self._item.update(QRectF(rect.adjusted(-grow, -grow, grow, grow)).intersected(self._item.boundingRect()))
 
     # ------------------------------------------------------------- drawing
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
