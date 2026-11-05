@@ -61,7 +61,10 @@ class WarmupTracker(QObject):
 
     # -- called by the engine (any thread)
     def report(self, stage: str, model_id: str) -> None:
-        self.stage_reported.emit(stage, model_id)
+        try:
+            self.stage_reported.emit(stage, model_id)
+        except RuntimeError:  # the window closed during the warm-up: nobody left to show it to
+            pass
 
     # -- UI thread
     def expected(self, model_id: str, stage: str) -> float:

@@ -9,8 +9,13 @@ back to CPU and says so; ``device="cuda"`` raises instead.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import platform
+import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -61,6 +66,8 @@ def is_out_of_memory(exc: BaseException) -> bool:
 class SessionInfo:
     model_path: Path
     provider: str  # the execution provider actually running the graph
+    # The cached optimised graph this session was loaded from (``None``: built from the model).
+    graph_cache: Path | None = None
 
     @property
     def on_gpu(self) -> bool:
@@ -192,21 +199,105 @@ def available_devices() -> list[str]:
     return devices
 
 
-def create_session(model_path: Path, device: str = "auto"):
+def graph_cache_root() -> Path | None:
+    """Folder for optimised model graphs, or ``None`` if caching is off.
+
+    ``%LOCALAPPDATA%\\Cutout\\graph-cache`` on Windows. ``CUTOUT_GRAPH_CACHE=0`` turns it off and
+    any other value is used as the folder.
+    """
+    env = os.environ.get("CUTOUT_GRAPH_CACHE", "").strip()
+    if env == "0":
+        return None
+    if env:
+        return Path(env)
+    return debug.log_dir().parent / "graph-cache"
+
+
+def _graph_cache_dir(model_path: Path, providers: list) -> Path | None:
+    """The cache folder for this exact model file, ONNX Runtime build, device and settings.
+
+    Any change (a model update, a new ONNX Runtime, other provider options, another CPU)
+    gives a new key, so a stale graph is never loaded.
+    """
+    root = graph_cache_root()
+    if root is None:
+        return None
+    try:
+        st = Path(model_path).stat()
+    except OSError:
+        return None
+    ort = _ort()
+    key = json.dumps({
+        "model": str(Path(model_path).resolve()), "size": st.st_size, "mtime": st.st_mtime_ns,
+        "ort": ort.__version__, "providers": repr(providers), "level": "all", "format": 1,
+        "cpu": platform.processor() or platform.machine(),
+    }, sort_keys=True)
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return root / f"{Path(model_path).stem}-{digest}"
+
+
+def _session_options(save_to: Path | None = None, optimize: bool = True):
+    ort = _ort()
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = (
+        ort.GraphOptimizationLevel.ORT_ENABLE_ALL if optimize else ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    )
+    # The CPU arena never gives memory back, and the person model's input and any
+    # CPU-placed nodes are large; plain malloc/free keeps RAM use to what is in use now.
+    opts.enable_cpu_mem_arena = False
+    opts.log_severity_level = debug.ort_log_severity()  # info in debug mode, errors otherwise
+    if save_to is not None:
+        # Weights go to a side file: a 2048 px model is too big for one protobuf file.
+        opts.optimized_model_filepath = str(save_to / GRAPH_FILE)
+        opts.add_session_config_entry("session.optimized_model_external_initializers_file_name", WEIGHTS_FILE)
+        opts.add_session_config_entry("session.optimized_model_external_initializers_min_size_in_bytes", "1024")
+    return opts
+
+
+def _provider_name(p) -> str:
+    return p[0] if isinstance(p, tuple) else p
+
+
+GRAPH_FILE = "model.onnx"
+WEIGHTS_FILE = "weights.bin"
+
+
+def forget_graph_cache(info: SessionInfo) -> None:
+    """Delete the cached graph a session came from (it failed to run); the next load rebuilds it."""
+    if info.graph_cache is not None:
+        log.warning("dropping the cached graph %s", info.graph_cache.name)
+        shutil.rmtree(info.graph_cache, ignore_errors=True)
+
+
+def _store_graph(tmp: Path, final: Path) -> None:
+    """Move a freshly saved graph into place and remove older graphs of the same model."""
+    try:
+        stem = final.name.rsplit("-", 1)[0]
+        same_model = re.compile(re.escape(stem) + r"-[0-9a-f]{16}(\.tmp\d+)?")
+        for old in final.parent.iterdir():
+            # Older graphs of this model and saves a crash left half done.
+            if old.is_dir() and old not in (final, tmp) and same_model.fullmatch(old.name):
+                shutil.rmtree(old, ignore_errors=True)
+        tmp.rename(final)  # a folder rename is atomic: a half-written graph is never used
+        log.info("saved the optimised graph of %s for faster starts", final.name)
+    except OSError as exc:  # e.g. another copy of the app saved it first
+        log.debug("could not store the optimised graph %s: %s", final.name, exc)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def create_session(model_path: Path, device: str = "auto", graph_cache: bool = False):
     """Return ``(InferenceSession, SessionInfo)`` for an ONNX file.
 
     ``device`` is ``"auto"`` (CUDA if it works, else CPU), ``"cuda"`` or ``"cpu"``.
+
+    With ``graph_cache``, the graph ONNX Runtime builds from the model (fused, constant-folded)
+    is saved on the first load and reused by later ones, which then skip that work: it was most
+    of every start's load time. The cached graph is the same graph the session would build, so
+    the output does not change. A cached graph that fails to load is deleted and rebuilt.
     """
     if device not in ("auto", "cuda", "cpu"):
         raise ValueError(f"device must be auto, cuda or cpu, not {device!r}")
     ort = _ort()
-
-    opts = ort.SessionOptions()
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    opts.log_severity_level = 3
-    # The CPU arena never gives memory back, and the person model's input and any
-    # CPU-placed nodes are large; plain malloc/free keeps RAM use to what is in use now.
-    opts.enable_cpu_mem_arena = False
 
     providers: list = ["CPUExecutionProvider"]
     want_cuda = device in ("auto", "cuda")
@@ -226,17 +317,60 @@ def create_session(model_path: Path, device: str = "auto"):
         elif device == "cuda":
             raise DeviceUnavailable("onnxruntime was built without CUDA support")
 
-    opts.log_severity_level = debug.ort_log_severity()  # info in debug mode, errors otherwise
-    debug.log_memory(f"before loading {Path(model_path).name}")
+    name = Path(model_path).name
+    cache_dir = _graph_cache_dir(Path(model_path), providers) if graph_cache else None
+    debug.log_memory(f"before loading {name}")
     t0 = time.perf_counter()
-    session = ort.InferenceSession(str(model_path), sess_options=opts, providers=providers)
+    session = None
+    source = None
+    if cache_dir is not None and (cache_dir / GRAPH_FILE).is_file():
+        try:
+            session = ort.InferenceSession(
+                str(cache_dir / GRAPH_FILE), sess_options=_session_options(optimize=False), providers=providers
+            )
+            source = cache_dir
+            if session.get_providers()[0] != _provider_name(providers[0]):
+                # Built for a device that did not start this time: not the graph to use here.
+                log.info("cached graph for %s is for another device; loading the model", name)
+                session, source = None, None
+        except Exception as exc:
+            if is_out_of_memory(exc):
+                raise
+            log.warning("cached graph for %s did not load (%s); rebuilding it", name, exc)
+            shutil.rmtree(cache_dir, ignore_errors=True)
+    if session is None:
+        tmp = None
+        if cache_dir is not None:
+            tmp = cache_dir.with_name(f"{cache_dir.name}.tmp{os.getpid()}")
+            try:
+                shutil.rmtree(tmp, ignore_errors=True)
+                tmp.mkdir(parents=True)
+            except OSError as exc:
+                log.debug("graph cache unavailable (%s)", exc)
+                tmp = None
+        try:
+            session = ort.InferenceSession(str(model_path), sess_options=_session_options(tmp), providers=providers)
+        except Exception as exc:
+            if tmp is None or is_out_of_memory(exc):
+                raise
+            log.warning("saving the optimised graph of %s failed (%s); loading without it", name, exc)
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp = None
+            session = ort.InferenceSession(str(model_path), sess_options=_session_options(), providers=providers)
+        if tmp is not None:
+            # Keep only a graph built for the device asked for (not a CPU fallback's).
+            if (tmp / GRAPH_FILE).is_file() and session.get_providers()[0] == _provider_name(providers[0]):
+                _store_graph(tmp, cache_dir)
+            else:
+                shutil.rmtree(tmp, ignore_errors=True)
     active = session.get_providers()[0]
-    log.info("loaded %s on %s in %.1fs", Path(model_path).name, active, time.perf_counter() - t0)
-    debug.log_memory(f"after loading {Path(model_path).name}")
+    log.info("loaded %s on %s in %.1fs%s", name, active, time.perf_counter() - t0,
+             " (optimised graph from cache)" if source is not None else "")
+    debug.log_memory(f"after loading {name}")
     if want_cuda and active != "CUDAExecutionProvider":
         if device == "cuda":
             raise DeviceUnavailable(
                 "CUDA execution provider failed to initialise (check the NVIDIA driver is up to date)"
             )
-        log.warning("CUDA unavailable, running %s on CPU (this will be slow)", Path(model_path).name)
-    return session, SessionInfo(model_path=Path(model_path), provider=active)
+        log.warning("CUDA unavailable, running %s on CPU (this will be slow)", name)
+    return session, SessionInfo(model_path=Path(model_path), provider=active, graph_cache=source)

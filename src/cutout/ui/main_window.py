@@ -1158,6 +1158,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.settings.setValue("geometry", self.saveGeometry())
+        # Don't let a model warm-up keep the closing app (or an update restart) waiting.
+        self.engine.stop_warmups()
         event.accept()
 
     def _restore_settings(self) -> None:

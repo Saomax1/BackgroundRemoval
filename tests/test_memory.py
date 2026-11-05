@@ -385,3 +385,20 @@ def test_onnx_warmup_can_be_cancelled(tmp_path):
         seg.warmup(cancel=stop)
     seg.cancel_warmup()  # nothing running: harmless
     assert seg.predict(np.zeros((32, 32, 3), np.uint8)).shape == (32, 32)
+
+
+def test_stop_warmups_cancels_a_running_warmup_and_skips_the_rest(tmp_path, long_warmup):
+    """Closing the app mid warm-up used to wait for it (and the update restart with it)."""
+    _install(tmp_path, "birefnet-hr-matting", "toonout")
+    engine = CutoutEngine(models_dir=tmp_path, segmenter_factory=long_warmup, max_resident=2)
+    stages = []
+    warm = threading.Thread(target=engine.warmup_all, args=(Subject.PERSON, lambda s, m: stages.append((s, m))))
+    warm.start()
+    assert long_warmup.started.wait(5)
+    t = time.perf_counter()
+    engine.stop_warmups()
+    warm.join(5)
+    assert not warm.is_alive() and time.perf_counter() - t < 1.0
+    assert long_warmup.created == ["birefnet-hr-matting"]  # the anime model was never loaded
+    assert stages[-1] == ("done", "")
+    assert "birefnet-hr-matting" not in engine._warm
