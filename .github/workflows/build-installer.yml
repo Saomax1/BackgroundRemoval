@@ -299,7 +299,11 @@ jobs:
           $tag = "v$env:VERSION"
           $repo = "${{ github.repository }}"
           $files = @(Get-Content dist/release/upload.txt | Where-Object { $_ -and $_ -notlike '*cutout-release.json' })
-          gh release create $tag --repo $repo --draft --title "Cutout $env:VERSION" --notes-file build/notes.md --target ${{ github.sha }} $env:SETUP @files
+          # Same Setup under a fixed name, so the README can link straight to
+          # releases/latest/download/Cutout-Setup.exe. The updater reads only the manifest.
+          New-Item -ItemType Directory -Force dist/latest | Out-Null
+          Copy-Item $env:SETUP dist/latest/Cutout-Setup.exe
+          gh release create $tag --repo $repo --draft --title "Cutout $env:VERSION" --notes-file build/notes.md --target ${{ github.sha }} $env:SETUP dist/latest/Cutout-Setup.exe @files
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           # The manifest goes up last and the release only becomes visible once every file
           # is there, so the app never sees a half-uploaded release.
