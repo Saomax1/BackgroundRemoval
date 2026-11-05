@@ -377,6 +377,48 @@ def memory_snapshot() -> str:
     return " | ".join(parts) or "memory: unknown"
 
 
+class GpuPeak:
+    """In debug mode, samples VRAM in a thread while the ``with`` block runs; ``summary()``
+    is then ``", VRAM peak 6.9/8.0 GB"``. Shows whether a slow run filled the card (Windows
+    then spills into system memory, which is many times slower). A no-op otherwise."""
+
+    INTERVAL = 0.5
+
+    def __init__(self):
+        self.peak_mib: int | None = None
+        self.total_mib: int | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "GpuPeak":
+        if enabled():
+            self._thread = threading.Thread(target=self._sample, name="gpu-peak", daemon=True)
+            self._thread.start()
+        return self
+
+    def _sample(self) -> None:
+        while True:
+            try:
+                g = gpu_usage()
+            except Exception:  # noqa: BLE001 - diagnostics must never break a run
+                g = []
+            if g:
+                self.peak_mib = max(self.peak_mib or 0, g[0]["used_mib"])
+                self.total_mib = g[0]["total_mib"]
+            if self._stop.wait(self.INTERVAL):
+                return
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def summary(self) -> str:
+        if self.peak_mib is None or not self.total_mib:
+            return ""
+        return f", VRAM peak {self.peak_mib / 1024:.2f}/{self.total_mib / 1024:.2f} GB"
+
+
 def log_memory(when: str) -> None:
     """In debug mode, log a memory snapshot labelled ``when``. A no-op otherwise (nvidia-smi is slow)."""
     if enabled():

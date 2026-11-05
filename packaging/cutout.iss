@@ -63,6 +63,8 @@ Type: filesandordirs; Name: "{app}\models"
 Type: filesandordirs; Name: "{app}\_internal"
 Type: files; Name: "{app}\release.json"
 Type: files; Name: "{app}\install-state.json"
+; Optimised model graphs the app saved for faster starts (about the size of the models).
+Type: filesandordirs; Name: "{localappdata}\Cutout\graph-cache"
 
 [Messages]
 FinishedLabel=Cutout is installed.%n%nThe first time it starts it downloads its AI models and GPU support (about {#FirstRunGB} GB, once). After that it works fully offline.

@@ -9,6 +9,7 @@ a future click-to-select model can reuse the same shape).
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 from typing import Protocol
@@ -17,7 +18,9 @@ import cv2
 import numpy as np
 
 from .models import ModelSpec, ResizeMode
-from .runtime import SessionInfo, create_session, run_options
+from .runtime import SessionInfo, create_session, forget_graph_cache, is_out_of_memory, run_options
+
+log = logging.getLogger(__name__)
 
 
 class Segmenter(Protocol):
@@ -33,7 +36,12 @@ class Segmenter(Protocol):
 class OnnxSegmenter:
     def __init__(self, spec: ModelSpec, model_file: Path, device: str = "auto"):
         self.spec = spec
-        self.session, self.info = create_session(model_file, device)
+        self._model_file = Path(model_file)
+        self._device = device
+        self._open(graph_cache=True)
+
+    def _open(self, graph_cache: bool) -> None:
+        self.session, self.info = create_session(self._model_file, self._device, graph_cache=graph_cache)
         inp = self.session.get_inputs()[0]
         self._input_name = inp.name
         self._input_dtype = np.float16 if "float16" in inp.type else np.float32
@@ -52,7 +60,18 @@ class OnnxSegmenter:
 
     def _predict(self, rgb: np.ndarray, opts) -> np.ndarray:
         tensor, crop = preprocess(rgb, self.spec)
-        outputs = self.session.run(None, {self._input_name: tensor.astype(self._input_dtype)}, opts)
+        feed = {self._input_name: tensor.astype(self._input_dtype)}
+        try:
+            outputs = self.session.run(None, feed, opts)
+        except Exception as exc:
+            if self.info.graph_cache is None or is_out_of_memory(exc) or opts.terminate:
+                raise
+            # A cached graph that loads but will not run: drop it and use the model itself.
+            log.warning("%s failed on its cached graph (%s); reloading the model", self.spec.id, exc)
+            forget_graph_cache(self.info)
+            self.session = None
+            self._open(graph_cache=False)
+            outputs = self.session.run(None, feed, opts)
         return postprocess(outputs[self.spec.output_index], crop, self.spec)
 
     def warmup(self, cancel: threading.Event | None = None) -> None:

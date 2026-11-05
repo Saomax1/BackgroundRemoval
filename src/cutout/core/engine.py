@@ -146,6 +146,7 @@ class CutoutEngine:
         self._cutouts_waiting = 0
         self._warming: tuple[str, Segmenter, threading.Event] | None = None
         self._warm: set[str] = set()
+        self._warmups_stopped = False
         self._max_resident = max_resident
         self._face_finder: FaceFinder | None = None
 
@@ -256,8 +257,10 @@ class CutoutEngine:
         report = progress or (lambda stage, model_id: None)
         while True:
             with self._turns:
-                self._turns.wait_for(lambda: self._cutouts_waiting == 0)
+                self._turns.wait_for(lambda: self._cutouts_waiting == 0 or self._warmups_stopped)
             with self._infer_lock:
+                if self._warmups_stopped:
+                    return False
                 if self._cutouts_waiting:
                     continue  # a cutout arrived while we waited for the lock: it goes first
                 if spec.id in self._warm and spec.id in self._segmenters:
@@ -268,7 +271,7 @@ class CutoutEngine:
                 if not hasattr(seg, "warmup"):
                     return False
                 with self._turns:
-                    if self._cutouts_waiting:
+                    if self._cutouts_waiting or self._warmups_stopped:
                         continue
                     cancel = threading.Event()
                     self._warming = (spec.id, seg, cancel)
@@ -276,19 +279,36 @@ class CutoutEngine:
                 t = time.perf_counter()
                 cancelled = False
                 try:
-                    seg.warmup(cancel=cancel)
+                    with debug.GpuPeak() as peak:  # debug mode only: VRAM high-water mark
+                        seg.warmup(cancel=cancel)
                 except WarmupCancelled:
                     cancelled = True
                 finally:
                     with self._turns:
                         self._warming = None
+                if self._warmups_stopped:
+                    log.info("stopped warming up %s after %.1fs: the app is closing",
+                             spec.id, time.perf_counter() - t)
+                    return False
                 if not cancelled:
-                    log.info("warmed up %s in %.1fs", spec.id, time.perf_counter() - t)
+                    log.info("warmed up %s in %.1fs%s", spec.id, time.perf_counter() - t, peak.summary())
                     self._warm.add(spec.id)
                     return True
                 log.info("paused warming up %s after %.1fs: a cutout needs the GPU",
                          spec.id, time.perf_counter() - t)
                 report("paused", spec.id)
+
+    def stop_warmups(self) -> None:
+        """Stop the background warm-up for good (the app is closing): a run in progress is
+        cancelled, so closing does not wait for it."""
+        with self._turns:
+            self._warmups_stopped = True
+            warming = self._warming
+            self._turns.notify_all()
+        if warming is not None:
+            warming[2].set()
+            if hasattr(warming[1], "cancel_warmup"):
+                warming[1].cancel_warmup()
 
     def warmup_plan(self, first: Subject = Subject.PERSON) -> list[str]:
         """Model ids ``warmup_all(first)`` will warm, in order (installed ones only)."""
@@ -313,6 +333,8 @@ class CutoutEngine:
             progress("plan", ",".join(self.warmup_plan(first)))
         try:
             for subject in order[: self.max_resident]:
+                if self._warmups_stopped:
+                    break
                 try:
                     self.warmup(subject, progress)
                 except ModelNotInstalled:

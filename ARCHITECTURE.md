@@ -205,7 +205,18 @@ engine.release_models()  # unload everything, e.g. before a memory-hungry step
   `RunOptions.terminate` (the warm-up resumes afterwards), and no warm-up starts
   while a cutout is waiting. A cutout for the model being warmed waits for it
   and then runs warm. The debug report's timings show
-  `wait`, `model_load` and `first_run_of_model` separately.
+  `wait`, `model_load` and `first_run_of_model` separately. Closing the window
+  calls `stop_warmups()`, which cancels a running warm-up so exit (and an update
+  restart) does not wait for it.
+- Optimised-graph cache: ONNX Runtime's graph optimisation (fusions, constant
+  folding) was most of each start's 4-5 s per model load. The first load saves the
+  optimised graph to `%LOCALAPPDATA%\Cutout\graph-cache\<model>-<key>` (weights
+  in a side file); later loads open it with optimisation off. The key covers the
+  model file (path, size, mtime), the ORT version, provider options and CPU, so any
+  change rebuilds it; older graphs of the model are deleted. A cached graph that
+  fails to load or run is deleted and the model is loaded as before. It is the same
+  graph ORT would build, so output is bit-identical (`tests/test_graph_cache.py`).
+  `CUTOUT_GRAPH_CACHE=0` turns it off. In debug mode a warm-up logs its VRAM peak.
 - Sessions use `arena_extend_strategy=kSameAsRequested` and every run asks ORT
   to shrink the GPU arena afterwards (`memory.enable_memory_arena_shrinkage`),
   so activations are not parked in VRAM between runs. The CPU arena is off for
