@@ -5,15 +5,26 @@ character and saves a transparent PNG. It runs entirely on your own PC, uses
 your NVIDIA graphics card to go fast, and never shrinks your picture: what comes
 out is exactly the same size as what went in.
 
-**Where things stand:** the background-removal engine works from a command
-window and in the editor window, which also has touch-up brushes and
-click-to-select. A one-click `Setup.exe` is built automatically on GitHub: download it
-from the [latest release](https://github.com/Saomax1/BackgroundRemoval/releases/latest)
-(no sign-in needed). The first time Cutout starts it downloads its AI models
-(about 3 GB, once). To update later, choose **Help > Check for Updates** in the
-app: it downloads only what changed, usually a few tens of MB, and restarts.
-Your settings are kept. Details are in [packaging/README.md](packaging/README.md).
-If you'd rather run from source, use the steps below. You only do them once.
+## Download and install
+
+**[Download Cutout-Setup.exe](https://github.com/Saomax1/BackgroundRemoval/releases/latest/download/Cutout-Setup.exe)**
+(always the newest version, no sign-in needed). You can also pick a version and read
+what changed on the [releases page](https://github.com/Saomax1/BackgroundRemoval/releases/latest).
+
+1. Run `Cutout-Setup.exe`. Windows may show "Windows protected your PC" because
+   the app isn't signed: click **More info**, then **Run anyway**.
+2. Click through the installer and start **Cutout** from the Start menu.
+3. The first start downloads the GPU support and AI models (about 3 GB, once).
+   After that Cutout works fully offline.
+
+You need Windows 10 or 11 with an NVIDIA graphics card (driver 528 or newer).
+
+To update later, choose **Help > Check for Updates** in the app. It downloads
+only what changed, usually a few tens of MB, restarts, and keeps your settings.
+Installer details are in [packaging/README.md](packaging/README.md).
+
+The rest of this page is for running Cutout from source code instead, which most
+people don't need.
 
 ---
 
@@ -225,3 +236,9 @@ thrown away and started fresh.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how the engine is put together.
 Install with `pip install -e ".[gpu,ui,dev]"` (or `".[cpu,ui,dev]"` without an NVIDIA
 card) and run the tests with `pytest`. The tests need no models or GPU.
+
+## Credits
+
+Cutout is built on free, open-source AI models (BiRefNet, ToonOut, anime-segmentation,
+SAM 2.1 and YuNet) and libraries. Their authors and licenses are listed in
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which is also installed next to Cutout.exe.
