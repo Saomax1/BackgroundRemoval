@@ -18,6 +18,7 @@ on:
       - "scripts/**"
       - "src/cutout/core/models.py"
       - "src/cutout/core/prompt_segmenter.py"
+      - "src/cutout/core/enhance.py"
       - "src/cutout/core/runtime.py"
       - "pyproject.toml"
       - ".github/workflows/build-installer.yml"
@@ -126,8 +127,46 @@ jobs:
           key: ${{ steps.key.outputs.key }}
           enableCrossOsArchive: true
 
+  enhance-models:
+    # Enhance (Real-ESRGAN upscalers exported from their .pth, GFPGAN downloaded). Separate
+    # job and cache so a failure here only leaves Enhance out of the installer.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: key
+        run: echo "key=enhance-models-${{ env.MODELS_CACHE_SALT }}-${{ hashFiles('src/cutout/core/models.py', 'src/cutout/core/enhance.py', 'scripts/export_realesrgan_onnx.py', 'scripts/build_enhance_models.py') }}" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/enhance-models
+          key: ${{ steps.key.outputs.key }}
+          enableCrossOsArchive: true
+          lookup-only: true
+      - uses: actions/setup-python@v5
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install export toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: pip install -e ".[cpu]" onnx torch==2.5.1 --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Build and check Enhance models
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python scripts/build_enhance_models.py --models-dir build/enhance-models
+      - name: Show manifest
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        run: cat build/enhance-models/manifest.json || true
+      - uses: actions/cache/save@v4
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: build/enhance-models
+          key: ${{ steps.key.outputs.key }}
+          enableCrossOsArchive: true
+
   installer:
-    needs: [models, prompt-models]
+    needs: [models, prompt-models, enhance-models]
     # Ship without click-to-select rather than not at all if only the SAM export failed.
     if: ${{ !cancelled() && needs.models.result == 'success' }}
     runs-on: windows-latest
@@ -176,6 +215,18 @@ jobs:
         run: |
           $files = Get-ChildItem build/prompt-models/*.onnx -ErrorAction SilentlyContinue
           if (-not $files) { "::warning::No click-to-select model; this build ships without it."; exit 0 }
+          $files | ForEach-Object { Copy-Item $_ dist/Cutout/models/; "staged {0} ({1:N0} MB)" -f $_.Name, ($_.Length / 1MB) }
+
+      - uses: actions/cache/restore@v4
+        if: needs.enhance-models.result == 'success'
+        with:
+          path: build/enhance-models
+          key: ${{ needs.enhance-models.outputs.key }}
+          enableCrossOsArchive: true
+      - name: Stage Enhance models
+        run: |
+          $files = Get-ChildItem build/enhance-models/*.onnx -ErrorAction SilentlyContinue
+          if (-not $files) { "::warning::No Enhance models; this build ships without Enhance."; exit 0 }
           $files | ForEach-Object { Copy-Item $_ dist/Cutout/models/; "staged {0} ({1:N0} MB)" -f $_.Name, ($_.Length / 1MB) }
 
       - name: Report app size
@@ -271,6 +322,16 @@ jobs:
             python -c "from PIL import Image; im=Image.open(r'$out'); assert im.mode=='RGBA' and im.size==(433,601), (im.mode, im.size); print('ok', im.size)"
             if ($LASTEXITCODE) { throw "$subject output is wrong" }
           }
+
+          if (Test-Path (Join-Path $dir "models/realesrgan-x4plus*.onnx")) {
+            "--- enhance: 2x upscale of a small picture on the CPU"
+            python -c "import numpy as np; from PIL import Image; y,x=np.mgrid[0:45,0:37]; a=np.stack([x*6,y*5,(x*y)%255],-1).astype('uint8'); Image.fromarray(a).save(r'$env:RUNNER_TEMP\small.png')"
+            $out = Join-Path $env:RUNNER_TEMP "small_enhanced.png"
+            & $cli "$env:RUNNER_TEMP\small.png" --enhance 2 --enhance-only --device cpu -o $out
+            if ($LASTEXITCODE) { throw "enhance failed" }
+            python -c "from PIL import Image; im=Image.open(r'$out'); assert im.size==(74,90), im.size; print('ok', im.size)"
+            if ($LASTEXITCODE) { throw "enhanced output is wrong" }
+          } else { "::warning::no Enhance model installed; skipping the enhance smoke test" }
 
           "--- update: a newer version where only the app part changed"
           "ci" | Set-Content dist/Cutout/_internal/cutout/ci-update-marker.txt

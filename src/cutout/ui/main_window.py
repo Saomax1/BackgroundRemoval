@@ -1,8 +1,9 @@
 """The editor window: open or drop one image, remove the background, touch up, save.
 
-Flow: open -> the image is shown and waits -> the user checks Person / Anime and
-presses "Remove Background" -> preview over a checkerboard -> (optional) touch-up
-tools -> Save PNG at the exact input resolution.
+Flow: open -> the image is shown and waits -> the user checks Person / Anime,
+(optional) Enhance makes it bigger and sharper, and presses "Remove Background" ->
+preview over a checkerboard -> (optional) touch-up tools -> Save PNG at the exact
+resolution of the (enhanced) picture.
 
 Every engine call runs on ``QThreadPool`` (see ``workers.py``); while one runs a
 busy overlay covers the canvas and the actions that would conflict are disabled.
@@ -49,15 +50,24 @@ from PySide6.QtWidgets import (
 
 import numpy as np
 
-from ..core.engine import CutoutEngine, CutoutResult
+from ..core.engine import CutoutEngine, CutoutResult, EnhanceResult
+from ..core.enhance import EnhanceTooLarge
 from ..core.head import Face, HeadCut, NoFaceFound
 from ..core import debug, parallel
-from ..core.imageio import SUPPORTED_EXTENSIONS, LoadedImage, encode_rgba_png, load_image, write_png_bytes
+from ..core.imageio import (
+    SUPPORTED_EXTENSIONS,
+    LoadedImage,
+    encode_rgba_png,
+    load_image,
+    save_rgb_png,
+    write_png_bytes,
+)
 from ..core.models import REGISTRY, ModelNotInstalled, Subject
 from ..core.runtime import GpuOutOfMemory
 from .warmup import WarmupBar, WarmupTracker
 from ..core.refine import compose_rgba
 from . import debug_menu, update_ui
+from .enhance_ui import ENHANCE_TIP, EnhanceDialog
 from .canvas import Backdrop, CutoutCanvas
 from .document import CutoutDocument
 from .head_tool import HeadBoxTool
@@ -76,6 +86,10 @@ def is_supported_image(path: str | os.PathLike) -> bool:
 
 def default_output_path(source: Path) -> Path:
     return source.with_name(f"{source.stem}_cutout.png")
+
+
+def default_enhanced_path(source: Path, scale: int) -> Path:
+    return source.with_name(f"{source.stem}_enhanced_{scale}x.png")
 
 
 HEAD_ONLY_TIP = "Keep only the head (face, hair and hat), cut at the neck; everything else transparent"
@@ -162,6 +176,10 @@ class BusyOverlay(QWidget):
         self.show()
         self._timer.start()
 
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self.update()
+
     def stop(self) -> None:
         self._timer.stop()
         self.hide()
@@ -199,6 +217,7 @@ class ConfirmBar(QWidget):
     checks the picture (and Person / Anime) and presses Remove Background."""
 
     confirmed = Signal()
+    enhance_requested = Signal()
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
@@ -218,7 +237,13 @@ class ConfirmBar(QWidget):
         self.head_only.setObjectName("confirmHeadOnly")
         self.head_only.setToolTip(HEAD_ONLY_TIP)
         self.head_only.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.enhance = QPushButton("Enhance…")
+        self.enhance.setObjectName("optionButton")
+        self.enhance.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.enhance.setToolTip(ENHANCE_TIP + " (Ctrl+E)")
+        self.enhance.clicked.connect(self.enhance_requested)
         row.addWidget(self.label)
+        row.addWidget(self.enhance)
         row.addWidget(self.head_only)
         row.addWidget(self.button)
         self.hide()
@@ -243,6 +268,10 @@ class MainWindow(QMainWindow):
     task_failed = Signal(str)
     #: Emitted when Head only found no face (the Mark Face tool is then active).
     head_not_found = Signal()
+    #: Emitted after an enhanced picture replaced the open one.
+    enhanced = Signal()
+    # Progress text from the enhance worker thread (delivered on the UI thread).
+    _enhance_progress = Signal(str)
 
     def __init__(
         self,
@@ -273,6 +302,10 @@ class MainWindow(QMainWindow):
         # The face the user boxed with Mark Face on this image: re-runs (Redo Auto, a subject
         # switch) keep that head instead of searching again.
         self._marked_faces: list[Face] | None = None
+        # Enhance: the picture as opened (Enhance always starts from it, and "Back to
+        # Original" restores it) and the last enhance result shown. None when not enhanced.
+        self._original_image: LoadedImage | None = None
+        self._enhanced: EnhanceResult | None = None
 
         self.warmup_tracker = WarmupTracker(self.settings, parent=self)
 
@@ -321,6 +354,8 @@ class MainWindow(QMainWindow):
         self.overlay = BusyOverlay(self.stack)
         self.confirm_bar = ConfirmBar(self.stack)
         self.confirm_bar.confirmed.connect(self.start_removal)
+        self.confirm_bar.enhance_requested.connect(self.enhance_dialog)
+        self._enhance_progress.connect(self.overlay.set_text)
         self.confirm_bar.head_only.toggled.connect(lambda on: self.act_head.setChecked(on))
         self.canvas.zoom_changed.connect(self._on_zoom_changed)
         self.canvas.hover_pixel.connect(self._on_hover_pixel)
@@ -343,6 +378,8 @@ class MainWindow(QMainWindow):
         self.act_open = a("Open…", self.open_dialog, QKeySequence.StandardKey.Open, "Open an image")
         self.act_save = a("Save PNG", self.save, QKeySequence.StandardKey.Save, "Save the cutout as a transparent PNG")
         self.act_save_as = a("Save PNG As…", self.save_as, QKeySequence("Ctrl+Shift+S"), "Save to a new file")
+        self.act_save_enhanced = a("Save Enhanced Picture…", self.save_enhanced_as, None,
+                                   "Save the enhanced picture itself (no background removed) as a PNG")
         self.act_close = a("Close Image", self.close_image, QKeySequence.StandardKey.Close, "Close the image")
         self.act_quit = a("Exit", self.close, QKeySequence("Ctrl+Q"))
         self.act_undo = self.doc.undo_stack.createUndoAction(self, "Undo")
@@ -361,6 +398,9 @@ class MainWindow(QMainWindow):
         self.act_head = a("Head Only", None, None, HEAD_ONLY_TIP, checkable=True)
         self.act_head.toggled.connect(self._on_head_mode_changed)
         self.act_head.triggered.connect(self._on_head_triggered)
+        self.act_enhance = a("Enhance…", self.enhance_dialog, QKeySequence("Ctrl+E"), ENHANCE_TIP)
+        self.act_revert_enhance = a("Back to Original Picture", self.revert_enhance, None,
+                                    "Undo Enhance: go back to the picture as it was opened")
         self.act_fit = a("Fit to Window", self.canvas.fit_to_window, QKeySequence("Ctrl+0"), "Fit the image in the window")
         self.act_100 = a("Actual Pixels", self.canvas.actual_pixels, QKeySequence("Ctrl+1"), "Zoom to 100%")
         self.act_zoom_in = a("Zoom In", self.canvas.zoom_in, QKeySequence.StandardKey.ZoomIn, "Zoom in")
@@ -426,6 +466,7 @@ class MainWindow(QMainWindow):
         self.subject_buttons[Subject.PERSON].setChecked(True)
         self.subject_group.buttonClicked.connect(self._on_subject_clicked)
         tb.addWidget(seg)
+        tb.addAction(self.act_enhance)
         tb.addAction(self.act_head)
         tb.addAction(self.act_rerun)
         tb.addSeparator()
@@ -485,11 +526,15 @@ class MainWindow(QMainWindow):
     def _build_menus(self) -> None:
         mb = self.menuBar()
         m = mb.addMenu("&File")
-        for act in (self.act_open, None, self.act_save, self.act_save_as, None, self.act_close, None, self.act_quit):
+        for act in (self.act_open, None, self.act_save, self.act_save_as, self.act_save_enhanced, None,
+                    self.act_close, None, self.act_quit):
             m.addSeparator() if act is None else m.addAction(act)
         m = mb.addMenu("&Edit")
         m.addAction(self.act_undo)
         m.addAction(self.act_redo)
+        m.addSeparator()
+        m.addAction(self.act_enhance)
+        m.addAction(self.act_revert_enhance)
         m.addSeparator()
         m.addAction(self.act_head)
         m.addAction(self.act_rerun)
@@ -641,6 +686,14 @@ class MainWindow(QMainWindow):
         self.act_close.setEnabled(has_img and not busy)
         self.act_rerun.setEnabled(has_img and not busy)
         self.act_head.setEnabled(has_img and not busy)
+        can_enhance = has_img and self.engine.can_enhance(self.subject)
+        self.act_enhance.setEnabled(can_enhance and not busy)
+        self.act_enhance.setToolTip(ENHANCE_TIP + " (Ctrl+E)" if can_enhance or not has_img
+                                    else "Enhance isn't installed (no upscaling model found)")
+        self.confirm_bar.enhance.setVisible(can_enhance)
+        self.act_revert_enhance.setEnabled(self._original_image is not None and not busy)
+        self.act_save_enhanced.setEnabled(self._enhanced is not None
+                                          and self.doc.image is self._enhanced.image and not busy)
         # Before the first cutout this is the "go" button; after it, a re-run.
         self.act_rerun.setText("Redo Auto" if has_alpha else "Remove Background")
         self.act_confirm.setEnabled(self._awaiting_confirm and not busy)
@@ -708,6 +761,8 @@ class MainWindow(QMainWindow):
     def _on_loaded(self, image: LoadedImage) -> None:
         self._pop_busy()
         self._last_save_path = None
+        self._original_image = None
+        self._enhanced = None
         self.doc.set_image(image)
         self.statusBar().showMessage("Check the image, pick Person or Anime, then press Remove Background.", 8000)
 
@@ -719,6 +774,8 @@ class MainWindow(QMainWindow):
         if self.is_busy or not self._confirm_discard():
             return
         self._generation += 1
+        self._original_image = None
+        self._enhanced = None
         self.doc.clear()
 
     # -------------------------------------------------------------- removal
@@ -898,6 +955,129 @@ class MainWindow(QMainWindow):
         else:
             self._report_error("Background removal failed", exc)
 
+    # -------------------------------------------------------------- enhance
+    def enhance_dialog(self) -> None:
+        """Ask how much to enhance (Ctrl+E), then do it."""
+        image = self._original_image or self.doc.image
+        if image is None or self.is_busy or not self.engine.can_enhance(self.subject):
+            return
+        dlg = EnhanceDialog(self, image.width, image.height, self.settings,
+                            is_photo=self.subject is Subject.PERSON, faces_available=self.engine.can_fix_faces())
+        if dlg.exec() == EnhanceDialog.DialogCode.Accepted:
+            self.start_enhance(dlg.scale, dlg.wants_faces)
+
+    def start_enhance(self, scale: int, fix_faces: bool = True) -> None:
+        """Enhance the picture as it was opened and show the result in its place.
+
+        The cutout is made from the enhanced picture: if one was already shown, the
+        automatic removal runs again on the new picture (a matte is never resized).
+        """
+        source = self._original_image or self.doc.image
+        if source is None or self.is_busy:
+            return
+        if not self._confirm_discard():
+            return
+        self._generation += 1
+        gen = self._generation
+        subject = self.subject
+        had_cutout = self.doc.has_alpha
+        engine = self.engine
+        emit = self._enhance_progress.emit
+        names = {"upscale": "Enhancing", "faces": "Fixing faces"}
+
+        def progress(stage: str, done: int, total: int) -> None:
+            label = names.get(stage, "Enhancing")
+            emit(f"{label}… {round(100 * done / total)}%" if stage == "upscale" and total > 1 else f"{label}…")
+
+        self._push_busy("Enhancing…")
+        self.run_in_background(
+            engine.enhance, source, subject, scale, fix_faces, 0.7, progress,
+            on_done=lambda r: self._on_enhanced(gen, source, r, had_cutout),
+            on_error=lambda e: self._on_enhance_failed(gen, e),
+        )
+
+    def _on_enhanced(self, gen: int, source: LoadedImage, result: EnhanceResult, had_cutout: bool) -> None:
+        self._pop_busy()
+        if gen != self._generation or source is not (self._original_image or self.doc.image):
+            return
+        self._original_image = source
+        self._enhanced = result
+        self._last_save_path = None
+        self.doc.set_image(result.image)
+        msg = f"Enhanced {result.scale}x: {result.image.width} × {result.image.height}."
+        if result.faces_fixed:
+            msg += " Fixed 1 face." if result.faces_fixed == 1 else f" Fixed {result.faces_fixed} faces."
+        if result.notice:
+            msg += " " + result.notice
+        self.statusBar().showMessage(msg, 15000)
+        self.enhanced.emit()
+        if had_cutout:
+            self.start_removal()
+
+    def _on_enhance_failed(self, gen: int, exc: BaseException) -> None:
+        self._pop_busy()
+        if gen != self._generation:
+            return
+        if isinstance(exc, ModelNotInstalled):
+            self._report_error("Enhance not installed", exc,
+                               "The upscaling model was not found, so the picture can't be enhanced.\n\n"
+                               f"Models folder:\n{self.engine.models_dir}")
+        elif isinstance(exc, (EnhanceTooLarge, GpuOutOfMemory)):
+            self._report_error("Can't enhance this picture", exc)
+        else:
+            self._report_error("Enhance failed", exc)
+
+    def revert_enhance(self) -> None:
+        """Go back to the picture as it was opened (the cutout is made again if one was shown)."""
+        original = self._original_image
+        if original is None or self.is_busy or not self._confirm_discard():
+            return
+        had_cutout = self.doc.has_alpha
+        self._generation += 1
+        self._original_image = None
+        self._enhanced = None
+        self._last_save_path = None
+        self.doc.set_image(original)
+        self.statusBar().showMessage("Back to the original picture.", 5000)
+        if had_cutout:
+            self.start_removal()
+
+    def save_enhanced_as(self) -> None:
+        res = self._enhanced
+        if res is None or self.is_busy or self.doc.image is not res.image:
+            return
+        src = self._original_image.source_path if self._original_image is not None else None
+        suggestion = default_enhanced_path(src or Path.home() / "picture.png", res.scale)
+        path, _ = QFileDialog.getSaveFileName(self, "Save enhanced picture", str(suggestion), "PNG image (*.png)")
+        if path:
+            self.save_enhanced_to(path)
+
+    def save_enhanced_to(self, path: str | os.PathLike) -> None:
+        """Write the enhanced picture (opaque, no cutout) as a lossless PNG on a worker thread."""
+        res = self._enhanced
+        if res is None or self.is_busy:
+            return
+        path = Path(path)
+        if path.suffix.lower() != ".png":
+            path = path.with_name(path.name + ".png")
+        if self.doc.path is not None and path.resolve() == self.doc.path.resolve():
+            self._report_error("Choose another name", ValueError(
+                "Saving over the original image would destroy it. Pick a different file name."))
+            return
+        image = res.image
+        self._push_busy(f"Saving {path.name}…")
+
+        def done(_):
+            self._pop_busy()
+            self.statusBar().showMessage(f"Saved {path}", 6000)
+            self.saved.emit(str(path))
+
+        def failed(exc: BaseException):
+            self._pop_busy()
+            self._report_error("Couldn't save the picture", exc)
+
+        self.run_in_background(save_rgb_png, path, image.rgb, image.icc_profile, on_done=done, on_error=failed)
+
     def warmup_in_background(self) -> None:
         """Load and warm the current subject's model (then the other one, if both fit) while
         the user picks a file. A cutout started meanwhile waits for it and then runs warm."""
@@ -1042,7 +1222,10 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.canvas)
             depth = "16-bit" if img.max_value > 255 else "8-bit"
             name = img.source_path.name if img.source_path else "image"
-            self.lbl_file.setText(f"{name}  ·  {img.width} × {img.height}  ·  {depth}")
+            extra = ""
+            if self._enhanced is not None and img is self._enhanced.image:
+                extra = f"  ·  enhanced {self._enhanced.scale}x"
+            self.lbl_file.setText(f"{name}  ·  {img.width} × {img.height}  ·  {depth}{extra}")
             self.lbl_model.clear()
             self.canvas.setFocus()
         self._sync_actions()

@@ -245,3 +245,119 @@ def resolve_prompt_model(models_dir: Path, model_id: str | None = None) -> Promp
         f"no click-to-select model installed in {models_dir}; expected the encoder and decoder of one of "
         f"{list(DEFAULT_PROMPT_MODELS)}"
     )
+
+
+# --- Enhance (upscaling and face restoration) ----------------------------------------
+#
+# Enhance is an optional step before the cutout: it makes a small or blurry picture
+# bigger and sharper (Real-ESRGAN), and can repair faces in photos (GFPGAN). Upscalers
+# are always 4x networks; 2x and 1x ("clean up only") are made by averaging 2x2 or 4x4
+# blocks of the 4x result, which is exact per tile and sharper than a native 2x model.
+
+
+class EnhanceRole(str, Enum):
+    UPSCALE = "upscale"
+    FACE = "face"
+
+
+@dataclass(frozen=True)
+class EnhanceModelSpec:
+    id: str
+    role: EnhanceRole
+    filename: str
+    # How much bigger the network makes its input (4 for the upscalers, 1 for face models).
+    scale: int = 4
+    # Square side a face model works at (faces are aligned to it); 0 for upscalers.
+    face_size: int = 0
+    # Direct download(s) of a ready-made ONNX file, first that works wins.
+    urls: tuple[str, ...] = ()
+    # PyTorch weights we export ourselves (scripts/export_realesrgan_onnx.py): a URL to a .pth.
+    export_source: str | None = None
+    # RRDBNet size for the exporter (Real-ESRGAN x4plus: 23 blocks; anime 6B: 6 blocks).
+    num_block: int = 23
+    sha256: str | None = None
+    approx_size_mb: int = 0
+    description: str = ""
+
+
+ENHANCE_REGISTRY: dict[str, EnhanceModelSpec] = {
+    spec.id: spec
+    for spec in (
+        EnhanceModelSpec(
+            id="realesrgan-x4plus",
+            role=EnhanceRole.UPSCALE,
+            filename="realesrgan-x4plus.onnx",
+            export_source="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+            num_block=23,
+            approx_size_mb=67,
+            description="Real-ESRGAN x4plus. Upscales and cleans up photos (blur, noise, JPEG blocks).",
+        ),
+        EnhanceModelSpec(
+            id="realesrgan-x4plus-anime-6b",
+            role=EnhanceRole.UPSCALE,
+            filename="realesrgan-x4plus-anime-6b.onnx",
+            export_source=(
+                "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
+            ),
+            num_block=6,
+            approx_size_mb=18,
+            description="Real-ESRGAN x4plus anime 6B. Keeps line art crisp and flat colours clean.",
+        ),
+        EnhanceModelSpec(
+            id="gfpgan-1.4",
+            role=EnhanceRole.FACE,
+            filename="gfpgan-1.4.onnx",
+            scale=1,
+            face_size=512,
+            urls=(
+                "https://huggingface.co/facefusion/models-3.0.0/resolve/main/gfpgan_1.4.onnx",
+                "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/gfpgan_1.4.onnx",
+                "https://github.com/facefusion/facefusion-assets/releases/download/models/gfpgan_1.4.onnx",
+            ),
+            approx_size_mb=340,
+            description="GFPGAN 1.4. Repairs blurry or blocky faces in photos (not used for anime).",
+        ),
+    )
+}
+
+DEFAULT_UPSCALERS: dict[Subject, tuple[str, ...]] = {
+    Subject.PERSON: ("realesrgan-x4plus", "realesrgan-x4plus-anime-6b"),
+    Subject.ANIME: ("realesrgan-x4plus-anime-6b", "realesrgan-x4plus"),
+}
+DEFAULT_FACE_MODELS: tuple[str, ...] = ("gfpgan-1.4",)
+
+
+def enhance_model_path(spec: EnhanceModelSpec, models_dir: Path) -> Path:
+    return Path(models_dir) / spec.filename
+
+
+def installed_enhance_models(models_dir: Path) -> list[EnhanceModelSpec]:
+    return [s for s in ENHANCE_REGISTRY.values() if enhance_model_path(s, models_dir).is_file()]
+
+
+def _resolve_enhance(order: tuple[str, ...], models_dir: Path, model_id: str | None, what: str) -> EnhanceModelSpec:
+    if model_id is not None:
+        if model_id not in ENHANCE_REGISTRY:
+            raise KeyError(f"unknown enhance model {model_id!r}; known: {sorted(ENHANCE_REGISTRY)}")
+        spec = ENHANCE_REGISTRY[model_id]
+        if not enhance_model_path(spec, models_dir).is_file():
+            raise ModelNotInstalled(f"enhance model {model_id!r} not found at {enhance_model_path(spec, models_dir)}")
+        return spec
+    for candidate in order:
+        spec = ENHANCE_REGISTRY[candidate]
+        if enhance_model_path(spec, models_dir).is_file():
+            return spec
+    raise ModelNotInstalled(
+        f"no {what} model installed in {models_dir}; expected one of "
+        f"{[ENHANCE_REGISTRY[c].filename for c in order]}"
+    )
+
+
+def resolve_upscaler(subject: Subject, models_dir: Path, model_id: str | None = None) -> EnhanceModelSpec:
+    """The upscaler for this subject: an explicit id, or the best one installed."""
+    return _resolve_enhance(DEFAULT_UPSCALERS[Subject(subject)], models_dir, model_id, "upscaling")
+
+
+def resolve_face_model(models_dir: Path, model_id: str | None = None) -> EnhanceModelSpec:
+    """The face restoration model: an explicit id, or the best one installed."""
+    return _resolve_enhance(DEFAULT_FACE_MODELS, models_dir, model_id, "face restoration")

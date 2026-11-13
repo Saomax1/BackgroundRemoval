@@ -116,6 +116,20 @@ def encode_rgba_png(rgba: np.ndarray, icc_profile: bytes | None = None) -> bytes
     return encode_png(rgba, icc_profile, level=6 if rgba.dtype == np.uint8 else 3)
 
 
+def encode_rgb_png(rgb: np.ndarray, icc_profile: bytes | None = None) -> bytes:
+    """PNG bytes of an opaque ``H x W x 3`` RGB picture (uint8 or uint16), e.g. an enhanced photo."""
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError(f"expected HxWx3 RGB, got shape {rgb.shape}")
+    if rgb.dtype not in (np.uint8, np.uint16):
+        raise TypeError(f"unsupported dtype {rgb.dtype}")
+    return encode_png(rgb, icc_profile, level=6 if rgb.dtype == np.uint8 else 3)
+
+
+def save_rgb_png(path: str | os.PathLike, rgb: np.ndarray, icc_profile: bytes | None = None) -> None:
+    """Write an opaque RGB picture as a lossless PNG, atomically (bit depth and ICC kept)."""
+    write_png_bytes(path, encode_rgb_png(rgb, icc_profile))
+
+
 def write_png_bytes(path: str | os.PathLike, payload: bytes) -> None:
     """Atomically write already-encoded PNG bytes (from ``encode_rgba_png``)."""
     _atomic_write(Path(path), payload)

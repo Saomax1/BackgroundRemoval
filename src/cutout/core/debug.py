@@ -520,12 +520,21 @@ def build_report(extra: str = "", models_dir: str | os.PathLike | None = None) -
         out.append(_section("ONNX Runtime / CUDA", f"diagnose failed: {exc!r}"))
 
     try:
-        from .models import PROMPT_REGISTRY, REGISTRY, default_models_dir, installed_models, installed_prompt_models
+        from .models import (
+            ENHANCE_REGISTRY,
+            PROMPT_REGISTRY,
+            REGISTRY,
+            default_models_dir,
+            installed_enhance_models,
+            installed_models,
+            installed_prompt_models,
+        )
 
         mdir = Path(models_dir) if models_dir else default_models_dir()
-        have = {s.id for s in installed_models(mdir)} | {s.id for s in installed_prompt_models(mdir)}
+        have = ({s.id for s in installed_models(mdir)} | {s.id for s in installed_prompt_models(mdir)}
+                | {s.id for s in installed_enhance_models(mdir)})
         lines = [f"models folder: {mdir}"]
-        for spec in [*REGISTRY.values(), *PROMPT_REGISTRY.values()]:
+        for spec in [*REGISTRY.values(), *PROMPT_REGISTRY.values(), *ENHANCE_REGISTRY.values()]:
             lines.append(f"  [{'installed' if spec.id in have else 'missing  '}] {spec.id}")
         out.append(_section("Models", "\n".join(lines)))
     except Exception as exc:  # noqa: BLE001
