@@ -74,9 +74,10 @@ The exporter rebuilds RRDBNet itself (same layer names as basicsr, so the offici
 `.pth` loads with `strict=True`) and exports with dynamic height and width, then
 compares ONNX Runtime with PyTorch on a random odd-sized tile.
 `scripts/build_enhance_models.py` builds all three and runs each through the app's
-own classes on CPU. **Not yet run end-to-end with the real weights** (the sandbox
-this was written in can't reach GitHub releases or Hugging Face); the
-`enhance-models` CI job is the first real run.
+own classes on CPU (the upscalers must give back a picture that matches the input
+when shrunk again). First real run: PR #24's `enhance-models` CI job, where all three
+built and passed, and the installer smoke test made a 2x picture with the installed app.
+Not yet tried on a GPU.
 
 ## Pipeline
 
