@@ -5,6 +5,10 @@ character and saves a transparent PNG. It runs entirely on your own PC, uses
 your NVIDIA graphics card to go fast, and never shrinks your picture: what comes
 out is exactly the same size as what went in.
 
+Got a small or blurry picture? Press **Enhance** before removing the background
+and Cutout makes it 2x or 4x bigger and sharper first (and repairs faces in
+photos), then cuts out the enhanced picture.
+
 ## Download and install
 
 **[Download Cutout-Setup.exe](https://github.com/Saomax1/BackgroundRemoval/releases/latest/download/Cutout-Setup.exe)**

@@ -77,7 +77,12 @@ what the CI smoke test does).
    exports the click-to-select model (SAM 2.1 Hiera-B+) and checks that one
    click selects a test shape. If it fails, the installer still builds, just
    without click-to-select.
-3. **installer** job (Windows):
+3. **enhance-models** job (Linux, cached): `scripts/build_enhance_models.py`
+   exports the two Real-ESRGAN upscalers from their official `.pth` files
+   (`scripts/export_realesrgan_onnx.py`, CPU torch), downloads GFPGAN 1.4 as ONNX,
+   and runs each through the app's classes. If it fails, the installer still
+   builds, just without Enhance (or without Fix faces).
+4. **installer** job (Windows):
    * `pip install -e .[gpu,ui,build]` pulls `onnxruntime-gpu` plus the
      `nvidia-*` CUDA/cuDNN wheels (CUDA 13 since onnxruntime-gpu 1.2x; the spec
      finds DLLs anywhere under `site-packages/nvidia`, whatever the layout).
@@ -97,7 +102,8 @@ what the CI smoke test does).
      install from the local packs (same code path as the first-start download);
      `cutout-cli --diagnose` must show the CUDA provider DLL loading from the
      install (no GPU needed for that), `--list-models`, and one person and one
-     anime cutout on CPU. Then it builds a newer version with one changed file,
+     anime cutout on CPU, and a 2x Enhance of a small picture if an upscaler was
+     staged. Then it builds a newer version with one changed file,
      checks that only the `app` pack is offered, applies it and cuts out again.
    * On `main`: publishes the release (as a draft first, manifest last, so the
      app never sees a half-uploaded release).

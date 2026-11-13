@@ -60,6 +60,24 @@ arrives with an ordinary app update, no model pack):
 |---|---|---|---|
 | Finding faces for Head only | **YuNet** 2023mar (`core/data/face_detection_yunet_2023mar.onnx`) | 230 KB | `opencv/opencv_zoo`, MIT licence. Run by OpenCV (`cv2.FaceDetectorYN`) on the CPU. |
 
+Enhance (an optional step before the cutout) uses two more kinds of model, picked
+the same way (best installed first). All are optional: without an upscaler the
+Enhance button is hidden, without a face model "Fix faces" is.
+
+| Use | Model (priority order) | Size | Source |
+|---|---|---|---|
+| Upscale, Person | **Real-ESRGAN x4plus** (`realesrgan-x4plus`), then the anime one | 67 MB | `RealESRGAN_x4plus.pth` (Real-ESRGAN release v0.1.0), exported by `scripts/export_realesrgan_onnx.py` |
+| Upscale, Anime | **Real-ESRGAN x4plus anime 6B** (`realesrgan-x4plus-anime-6b`), then the photo one | 18 MB | `RealESRGAN_x4plus_anime_6B.pth` (release v0.2.2.4), same exporter |
+| Fix faces (photos only) | **GFPGAN 1.4** (`gfpgan-1.4`) | 340 MB | ready-made ONNX (FaceFusion's conversion of GFPGANv1.4), downloaded |
+
+The exporter rebuilds RRDBNet itself (same layer names as basicsr, so the official
+`.pth` loads with `strict=True`) and exports with dynamic height and width, then
+compares ONNX Runtime with PyTorch on a random odd-sized tile.
+`scripts/build_enhance_models.py` builds all three and runs each through the app's
+own classes on CPU. **Not yet run end-to-end with the real weights** (the sandbox
+this was written in can't reach GitHub releases or Hugging Face); the
+`enhance-models` CI job is the first real run.
+
 ## Pipeline
 
 ```
@@ -110,6 +128,42 @@ switch (toolbar and next to Remove Background): before a cutout it says what the
 button makes; after one it cuts the head out or puts the whole cutout back, as
 undoable steps, without running the model again. `cutout --head` does it from the CLI.
 
+### Enhance
+
+`core/enhance.py`, `CutoutEngine.enhance(image, subject, scale, fix_faces)`. A step
+*before* the automatic removal that returns a new, bigger `LoadedImage`; the cutout is
+then made from it like from any opened picture (and so is at the enhanced size).
+
+1. **Scale.** The user picks 1x ("clean up only", same size), 2x or 4x. The
+   upscalers are 4x networks; 2x and 1x average 2x2 / 4x4 blocks of the 4x output.
+   That is an exact box filter inside each tile, so the 4x picture is never held in
+   memory, and it is sharper than a native 2x model. Output is capped at 36 MP
+   (`MAX_OUTPUT_PIXELS`): a request over it drops to the next scale that fits, with a
+   notice; a picture too big even at 1x is refused (`EnhanceTooLarge`).
+2. **Tiles.** 256 px input tiles with 24 px of real neighbouring picture on every
+   side that has one; only each tile's own area is kept, so there are no seams.
+   Bit depth is kept (16-bit in, 16-bit out, computed in float) and so is the ICC
+   profile. Progress is reported per tile.
+3. **Fix faces** (Person only; GFPGAN invents photo-real detail, wrong for drawings).
+   YuNet finds the faces on the upscaled picture; each is aligned from its five
+   landmarks to GFPGAN's 512x512 FFHQ template, repaired, warped back and blended
+   in through a feathered mask at strength 0.7 (keeps the person's likeness).
+   Faces whose eyes are already more than twice as far apart as in the template are
+   left alone (the 512 px repair would be softer than the picture).
+4. **GPU.** Enhance takes the same GPU turn as a cutout (pauses a warm-up, holds
+   `_infer_lock`). Its models are loaded for the run and dropped afterwards, so they
+   never stay resident next to the cutout models. Out of memory: everything is
+   unloaded, one GPU retry, then the CPU (`device="auto"`) with `notice` set.
+
+In the window, Enhance… (Ctrl+E, toolbar, and a button on the Remove Background bar)
+opens a small dialog: scale (sizes that would go over the cap are greyed out) and
+"Fix faces". Enhance always starts from the picture as opened, so trying 2x then 4x
+doesn't stack. If a cutout was already shown, the automatic removal runs again on the
+enhanced picture (a matte is never resized). Edit > Back to Original Picture undoes
+it, File > Save Enhanced Picture… saves the enhanced picture itself as an opaque PNG,
+and the cutout's default name stays `<original>_cutout.png`. CLI: `--enhance {1,2,4}`,
+`--enhance-only`, `--no-fix-faces`, `--face-strength`.
+
 ### CPU and GPU in tandem
 
 The GPU runs only the network (at 1-2K). Everything at the photo's own resolution
@@ -159,6 +213,7 @@ src/cutout/
     engine.py      CutoutEngine: the public API the UI and CLI use
     prompt_segmenter.py  PromptSegmenter protocol + OnnxSamSegmenter (click-to-select model)
     head.py        Head only: face finding (YuNet, data/) and the cut at the neck
+    enhance.py     Enhance: tiled Real-ESRGAN upscaling, GFPGAN face repair
     debug.py       log files, debug mode, crash detection, memory snapshots, the debug report
   cli.py           command-line front end (dev, benchmarks, installer smoke test)
   editing/         touch-up tools, pure NumPy/OpenCV on the alpha matte, no Qt
@@ -311,6 +366,7 @@ in the packaged `Cutout.exe`). Files in `src/cutout/ui`:
 | `tools.py` | `CanvasTool` base + `ToolContext`: the hook the touch-up tools plug into. |
 | `workers.py` | `Task` on `QThreadPool`; results come back as signals on the UI thread. |
 | `head_tool.py` | Mark Face tool: drag a box over a face when Head only finds none (or the wrong one). |
+| `enhance_ui.py` | The Enhance dialog (scale, Fix faces); the window runs it (`start_enhance`). |
 | `touchup.py` | Keep / Erase / Refine brushes and click-to-select on top of `cutout.editing`. `MatteBridge` keeps one `MatteEditor` (no own history) on the current matte and pushes each finished stroke or selection to the window's `QUndoStack` as a rect patch. Brush size is a diameter in image pixels (1 to 1000); under 5 px dabs snap to the pixel grid and paint whole pixels (`editing.brush.pixel_stamp`). |
 
 Behaviour worth knowing:

@@ -38,9 +38,10 @@ _ABS_INT8 = np.abs(np.arange(256, dtype=np.uint8).view(np.int8).astype(np.int16)
 
 
 def encode_png(rgba: np.ndarray, icc_profile: bytes | None = None, level: int = LEVEL) -> bytes:
-    """``H x W x 4`` RGBA (uint8 or uint16) -> PNG file bytes."""
-    if rgba.ndim != 3 or rgba.shape[2] != 4:
-        raise ValueError(f"expected HxWx4 RGBA, got shape {rgba.shape}")
+    """``H x W x 4`` RGBA or ``H x W x 3`` RGB (uint8 or uint16) -> PNG file bytes."""
+    if rgba.ndim != 3 or rgba.shape[2] not in (3, 4):
+        raise ValueError(f"expected HxWx4 RGBA or HxWx3 RGB, got shape {rgba.shape}")
+    channels = rgba.shape[2]
     if rgba.dtype == np.uint8:
         depth, rows = 8, np.ascontiguousarray(rgba)
     elif rgba.dtype == np.uint16:
@@ -51,7 +52,7 @@ def encode_png(rgba: np.ndarray, icc_profile: bytes | None = None, level: int = 
     if h == 0 or w == 0:
         raise ValueError("cannot encode an empty image")
     raw = rows.reshape(h, -1).view(np.uint8)  # one row of bytes per scanline
-    bpp = 4 * depth // 8
+    bpp = channels * depth // 8
 
     # Small strips bound the filter's temporary memory (about 20 bytes per input byte).
     parts = parallel.strips(h, w, max_pixels=_STRIP_PIXELS)
@@ -76,7 +77,7 @@ def encode_png(rgba: np.ndarray, icc_profile: bytes | None = None, level: int = 
         adler = adler32_combine(adler, a, n)
     stream = b"".join([b"\x78\x9c", *(p for p, _, _ in pieces), struct.pack(">I", adler)])
 
-    out = [SIGNATURE, _chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, depth, 6, 0, 0, 0))]
+    out = [SIGNATURE, _chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, depth, 6 if channels == 4 else 2, 0, 0, 0))]
     if icc_profile:
         out.append(_chunk(b"iCCP", b"ICC Profile\x00\x00" + zlib.compress(icc_profile)))
     for i in range(0, len(stream), _IDAT_SIZE):

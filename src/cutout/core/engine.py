@@ -40,17 +40,31 @@ from typing import Callable
 
 import numpy as np
 
+from .enhance import (
+    MAX_OUTPUT_PIXELS,
+    FaceRestorer,
+    OnnxFaceRestorer,
+    OnnxUpscaler,
+    Upscaler,
+    pick_scale,
+    restore_faces,
+    upscale_image,
+)
 from .imageio import LoadedImage, load_image, save_png
 from .models import (
+    EnhanceModelSpec,
     ModelNotInstalled,
     ModelSpec,
     PromptModelSpec,
     Subject,
     default_models_dir,
+    enhance_model_path,
     model_path,
     prompt_model_paths,
+    resolve_face_model,
     resolve_model,
     resolve_prompt_model,
+    resolve_upscaler,
 )
 from .prompt_segmenter import OnnxSamSegmenter, PromptSegmenter
 from .head import Face, FaceFinder, HeadCut, describe, head_only
@@ -92,6 +106,26 @@ def default_max_resident(device: str) -> int:
 WarmupProgress = Callable[[str, str], None]  # (stage, model id)
 SegmenterFactory = Callable[[ModelSpec, Path, str], Segmenter]
 PromptSegmenterFactory = Callable[[PromptModelSpec, Path, Path, str], PromptSegmenter]
+UpscalerFactory = Callable[[EnhanceModelSpec, Path, str], Upscaler]
+FaceRestorerFactory = Callable[[EnhanceModelSpec, Path, str], FaceRestorer]
+
+ENHANCE_CPU_NOTICE = (
+    "Your graphics card ran out of memory, so this picture was enhanced on the processor "
+    "instead. It is the same quality, just slower."
+)
+
+
+@dataclass
+class EnhanceResult:
+    image: LoadedImage  # the enhanced picture: ``scale`` times the size, same bit depth and ICC
+    scale: int  # what was made (can be lower than asked if the picture would be too big)
+    requested_scale: int
+    upscaler_id: str
+    face_model_id: str | None = None  # set when faces were looked for
+    faces_fixed: int = 0
+    device: str = "n/a"
+    timings: dict[str, float] = field(default_factory=dict)
+    notice: str | None = None
 
 
 @dataclass
@@ -124,6 +158,8 @@ class CutoutEngine:
         prompt_segmenter_factory: PromptSegmenterFactory | None = None,
         select_device: str | None = None,
         max_resident: int | None = None,
+        upscaler_factory: UpscalerFactory | None = None,
+        face_restorer_factory: FaceRestorerFactory | None = None,
     ):
         self.models_dir = Path(models_dir) if models_dir else default_models_dir()
         self.device = device
@@ -149,6 +185,8 @@ class CutoutEngine:
         self._warmups_stopped = False
         self._max_resident = max_resident
         self._face_finder: FaceFinder | None = None
+        self._upscaler_factory: UpscalerFactory = upscaler_factory or OnnxUpscaler
+        self._face_factory: FaceRestorerFactory = face_restorer_factory or OnnxFaceRestorer
 
     def segmenter_for(self, subject: Subject, model_id: str | None = None) -> Segmenter:
         return self._segmenter(resolve_model(subject, self.models_dir, model_id))
@@ -430,6 +468,154 @@ class CutoutEngine:
             prep=dataclasses.replace(prep, gray=None, guide=None),
         )
 
+    # ---------------------------------------------------------------- enhance
+    def can_enhance(self, subject: Subject = Subject.PERSON) -> bool:
+        """True if an upscaler is installed (any one works for either subject)."""
+        try:
+            resolve_upscaler(subject, self.models_dir)
+            return True
+        except ModelNotInstalled:
+            return False
+
+    def can_fix_faces(self) -> bool:
+        try:
+            resolve_face_model(self.models_dir)
+            return True
+        except ModelNotInstalled:
+            return False
+
+    def enhance(
+        self,
+        image: LoadedImage | str | os.PathLike,
+        subject: Subject = Subject.PERSON,
+        scale: int = 2,
+        fix_faces: bool = True,
+        face_strength: float = 0.7,
+        progress: Callable[[str, int, int], None] | None = None,
+        upscaler_id: str | None = None,
+    ) -> EnhanceResult:
+        """Upscale ``image`` by ``scale`` (1, 2 or 4) and, for photos, repair the faces.
+
+        Takes its turn on the GPU like a cutout (a warm-up is paused for it). The models are
+        loaded for this run only and dropped afterwards, so they never stay in graphics
+        memory next to the cutout models. Out of memory: everything is unloaded and it is
+        retried on the GPU, then (``device="auto"``) on the CPU, with ``notice`` set.
+        ``progress(stage, done, total)`` reports ``"upscale"`` tiles and ``"faces"``.
+        Raises ``ModelNotInstalled`` without an upscaler and ``enhance.EnhanceTooLarge`` if
+        the picture is already too big.
+        """
+        timings: dict[str, float] = {}
+        t0 = time.perf_counter()
+        if not isinstance(image, LoadedImage):
+            image = load_image(image)
+        timings["load"] = time.perf_counter() - t0
+        subject = Subject(subject)
+        up_spec = resolve_upscaler(subject, self.models_dir, upscaler_id)
+        made = pick_scale(image.width, image.height, scale)
+        face_spec = None
+        if fix_faces and subject is Subject.PERSON:
+            try:
+                face_spec = resolve_face_model(self.models_dir)
+            except ModelNotInstalled:
+                log.info("enhance: no face model installed; faces are upscaled only")
+        report = progress or (lambda stage, done, total: None)
+
+        t1 = time.perf_counter()
+        with self._turns:
+            self._cutouts_waiting += 1
+            warming = self._warming
+        if warming is not None:  # any warm-up: enhance uses other models, so stop it
+            warming[2].set()
+            if hasattr(warming[1], "cancel_warmup"):
+                warming[1].cancel_warmup()
+        notices: list[str] = []
+        try:
+            with self._infer_lock:
+                timings["wait"] = time.perf_counter() - t1
+                t1 = time.perf_counter()
+                out, device, cpu = self._run_enhance_model(
+                    up_spec, self._upscaler_factory,
+                    lambda m: upscale_image(image.rgb, m, made,
+                                            progress=lambda d, n: report("upscale", d, n)))
+                timings["upscale"] = time.perf_counter() - t1
+                if cpu:
+                    notices.append(ENHANCE_CPU_NOTICE)
+                fixed = 0
+                if face_spec is not None:
+                    t2 = time.perf_counter()
+                    faces = self.face_finder.detect(_as_uint8(out), 0.5)
+                    timings["find faces"] = time.perf_counter() - t2
+                    if faces:
+                        report("faces", 0, len(faces))
+                        t2 = time.perf_counter()
+                        fixes, _, cpu = self._run_enhance_model(
+                            face_spec, self._face_factory,
+                            lambda m: restore_faces(out, faces, m, face_strength))
+                        fixed = len(fixes)
+                        timings["fix faces"] = time.perf_counter() - t2
+                        if cpu and not notices:
+                            notices.append(ENHANCE_CPU_NOTICE)
+                        report("faces", len(faces), len(faces))
+        finally:
+            with self._turns:
+                self._cutouts_waiting -= 1
+                self._turns.notify_all()
+
+        if made < scale:
+            notices.insert(0, f"Enhanced {made}x instead of {scale}x: at {scale}x the picture would be "
+                              f"bigger than the {MAX_OUTPUT_PIXELS // 1_000_000} megapixel limit.")
+        debug.record_timings(
+            f"enhance {image.width}x{image.height} -> {out.shape[1]}x{out.shape[0]}", timings,
+            model=up_spec.id, device=device, scale=f"{made}x", faces_fixed=fixed,
+        )
+        return EnhanceResult(
+            image=LoadedImage(rgb=out, icc_profile=image.icc_profile, source_path=image.source_path),
+            scale=made,
+            requested_scale=scale,
+            upscaler_id=up_spec.id,
+            face_model_id=face_spec.id if face_spec is not None else None,
+            faces_fixed=fixed,
+            device=device,
+            timings=timings,
+            notice=" ".join(notices) or None,
+        )
+
+    def _run_enhance_model(self, spec: EnhanceModelSpec, factory, run):
+        """Load ``spec``, call ``run(model)``, drop the model. Returns (value, device, on_cpu_fallback).
+
+        On running out of memory: unload everything, try the GPU once more, then the CPU
+        (``device="auto"`` only). Never recovers inside the ``except`` block, whose
+        traceback would keep the failed session's memory alive.
+        """
+        path = enhance_model_path(spec, self.models_dir)
+        devices = [self.device]
+        if self.device != "cpu":
+            devices.append(self.device)
+        if self.device == "auto":
+            devices.append("cpu")
+        last = ""
+        for i, device in enumerate(devices):
+            failed: str | None = None
+            try:
+                model = factory(spec, path, device)
+                value = run(model)
+                info = getattr(model, "session_info", None)
+                where = "gpu" if (info is not None and info.on_gpu) else ("cpu" if info is not None else "n/a")
+                return value, where, device == "cpu" and i > 0
+            except Exception as exc:
+                if not is_out_of_memory(exc):
+                    raise
+                failed = str(exc)
+            finally:
+                model = None
+                gc.collect()
+            log.warning("%s ran out of memory on %s (%s); unloading all models", spec.id, device, failed)
+            last = failed
+            self.release_models()
+        log.error("giving up on %s: %s", spec.id, last)
+        raise GpuOutOfMemory("Your computer ran out of memory enhancing this picture. "
+                             "Close other programs and try again, or pick a smaller scale.")
+
     def _predict_after_oom(
         self, spec: ModelSpec, rgb: np.ndarray, first_error: str
     ) -> tuple[Segmenter, np.ndarray, str | None]:
@@ -469,6 +655,12 @@ class CutoutEngine:
                    "Close other programs that use it and try again.")
         log.error("giving up on %s: %s", spec.id, last)
         raise GpuOutOfMemory(msg)
+
+
+def _as_uint8(rgb: np.ndarray) -> np.ndarray:
+    if rgb.dtype == np.uint8:
+        return rgb
+    return np.round(rgb.astype(np.float32) * (255.0 / 65535.0)).astype(np.uint8)
 
 
 def _timed_prep(image: LoadedImage, opts: RefineOptions) -> tuple[ImagePrep, float]:

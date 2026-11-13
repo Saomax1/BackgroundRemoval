@@ -63,6 +63,9 @@ class Face:
     h: float
     score: float = 1.0
     roll: float = 0.0
+    # Five points from the detector (subject's right eye, left eye, nose tip, right and
+    # left mouth corner; i.e. image-left first), or ``None`` for a box the user drew.
+    landmarks: tuple[tuple[float, float], ...] | None = field(default=None, compare=False)
 
     @staticmethod
     def from_box(x0: float, y0: float, x1: float, y1: float) -> "Face":
@@ -169,7 +172,8 @@ class FaceFinder:
             if math.hypot(lx - rx, ly - ry) > 0.15 * bw:
                 roll = math.atan2(ly - ry, lx - rx)
                 roll = max(-math.radians(80), min(math.radians(80), roll))
-            faces.append(Face(float(x), float(y), float(bw), float(bh), float(r[14]), float(roll)))
+            marks = tuple((float(r[4 + 2 * i]) / scale, float(r[5 + 2 * i]) / scale) for i in range(5))
+            faces.append(Face(float(x), float(y), float(bw), float(bh), float(r[14]), float(roll), marks))
         faces.sort(key=lambda f: f.score, reverse=True)
         return faces
 
